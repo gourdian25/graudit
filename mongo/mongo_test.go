@@ -4,6 +4,7 @@ package mongo_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -26,33 +27,39 @@ import (
 //
 // Start a matching local container with:
 //
-//	docker run -d --name graudit-mongo -p 27018:27017 \
-//	  -e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=mongo_password \
-//	  mongo:7 --replSet rs0
-//	docker exec graudit-mongo mongosh -u root -p mongo_password --eval 'rs.initiate()'
-const testURI = "mongodb://root:mongo_password@localhost:27018/?directConnection=true&replicaSet=rs0"
+//	docker run -d --name graudit-mongo -p 27018:27017 mongo:7 --replSet rs0
+//	docker exec graudit-mongo mongosh --eval 'rs.initiate()'
+const testURI = "mongodb://localhost:27018/?directConnection=true&replicaSet=rs0"
 
 const testDatabase = "graudit_test"
 
-func dropTestDB(t *testing.T) {
-	t.Helper()
+// drop clears the test database so the next NewMongoAuditLog call sees an
+// empty chain. Every conformance scenario calls newLog() expecting a
+// fresh, empty AuditLog (true by construction for the memory backend, but
+// the mongo backend reconnects to the same persistent database on every
+// call unless explicitly cleared first) — this must run before *every*
+// newLog()/newLogWithBus() call, not just once at the top of
+// TestConformance, or later scenarios see documents left behind by earlier
+// ones and fail with ID/hash mismatches that look like corruption but are
+// actually just test-isolation bugs.
+func drop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(testURI))
 	if err != nil {
-		t.Fatalf("connect for drop: %v", err)
+		return // surfaced properly by NewMongoAuditLog's own connect/ping right after
 	}
 	defer client.Disconnect(ctx)
-	if err := client.Database(testDatabase).Drop(ctx); err != nil {
-		t.Fatalf("drop test database: %v", err)
-	}
+	_ = client.Database(testDatabase).Drop(ctx)
 }
 
 func newLog() (graudit.AuditLog, error) {
+	drop()
 	return graudmongo.NewMongoAuditLog(graudmongo.MongoConfig{URI: testURI, Database: testDatabase})
 }
 
 func newLogWithBus(bus grevents.Bus) (graudit.AuditLog, error) {
+	drop()
 	return graudmongo.NewMongoAuditLog(graudmongo.MongoConfig{URI: testURI, Database: testDatabase, EventBus: bus})
 }
 
@@ -80,7 +87,6 @@ func tamperEntry(t *testing.T, log graudit.AuditLog, entryID graudit.EntryID) {
 }
 
 func TestConformance(t *testing.T) {
-	dropTestDB(t)
 	conformance.Run(t, newLog, newLogWithBus, conformance.WithTamperHook(tamperEntry))
 }
 
@@ -114,3 +120,66 @@ func TestNewMongoAuditLog_MissingDatabase(t *testing.T) {
 func TestNewMongoAuditLog_RequiresReplicaSet(t *testing.T) {
 	t.Skip("requires a second, standalone (non-replica-set) MongoDB instance not provisioned in this environment; NewMongoAuditLog's fail-fast path is implemented via probeTransactionSupport, see mongo.go")
 }
+
+func TestNewMongoAuditLog_CustomCollectionAndLogger(t *testing.T) {
+	drop()
+	log, err := graudmongo.NewMongoAuditLog(graudmongo.MongoConfig{
+		URI: testURI, Database: testDatabase, Collection: "custom_entries", Logger: &recordingLogger{},
+	})
+	if err != nil {
+		t.Fatalf("NewMongoAuditLog with custom collection: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.Record(context.Background(), graudit.AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+		t.Fatalf("Record against custom collection: %v", err)
+	}
+}
+
+func TestRecordChange_InvalidPayload(t *testing.T) {
+	log, err := newLog()
+	if err != nil {
+		t.Fatalf("newLog: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.RecordChange(context.Background(), "actor:1", "widget", "w1", make(chan int), nil); !errors.Is(err, graudit.ErrInvalidEvent) {
+		t.Fatalf("RecordChange with an unmarshalable before value: err=%v, want ErrInvalidEvent", err)
+	}
+}
+
+func TestQuery_InvalidStoredPayload(t *testing.T) {
+	log, err := newLog()
+	if err != nil {
+		t.Fatalf("newLog: %v", err)
+	}
+	defer log.Close()
+
+	ctx := context.Background()
+	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(testURI))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Disconnect(ctx)
+	coll := client.Database(testDatabase).Collection("graudit_entries")
+	if _, err := coll.UpdateOne(ctx, bson.M{"entryId": uint64(1)}, bson.M{"$set": bson.M{"payload": []byte(`not-valid-json`)}}); err != nil {
+		t.Fatalf("corrupt payload: %v", err)
+	}
+
+	if _, err := log.Query(ctx, graudit.QueryFilter{}); err == nil {
+		t.Fatal("expected Query to surface a decode error for a corrupted payload, got nil")
+	}
+	if _, _, err := log.Verify(ctx, 1, 1); err == nil {
+		t.Fatal("expected Verify to surface a decode error for a corrupted payload, got nil")
+	}
+}
+
+type recordingLogger struct{}
+
+func (*recordingLogger) Infof(string, ...interface{})  {}
+func (*recordingLogger) Warnf(string, ...interface{})  {}
+func (*recordingLogger) Errorf(string, ...interface{}) {}

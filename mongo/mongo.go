@@ -307,7 +307,7 @@ func (a *AuditLog) Verify(ctx context.Context, from, to graudit.EntryID) (bool, 
 	if err != nil {
 		return false, graudit.VerifyResult{}, fmt.Errorf("graudit/mongo: verify: %w", graudit.ErrBackendUnavailable)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var docs []entryDocument
 	if err := cursor.All(ctx, &docs); err != nil {
@@ -380,7 +380,7 @@ func (a *AuditLog) Query(ctx context.Context, filter graudit.QueryFilter) ([]gra
 	if err != nil {
 		return nil, fmt.Errorf("graudit/mongo: query: %w", graudit.ErrBackendUnavailable)
 	}
-	defer cursor.Close(ctx)
+	defer func() { _ = cursor.Close(ctx) }()
 
 	var docs []entryDocument
 	if err := cursor.All(ctx, &docs); err != nil {

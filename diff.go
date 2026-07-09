@@ -39,11 +39,11 @@ type ChangeDiff map[string]FieldDiff
 func computeDiff(before, after any) (ChangeDiff, error) {
 	beforeMap, err := normalizeToObject(before)
 	if err != nil {
-		return nil, fmt.Errorf("graudit: diff: normalize before: %w", err)
+		return nil, fmt.Errorf("%w: diff: normalize before: %v", ErrInvalidEvent, err)
 	}
 	afterMap, err := normalizeToObject(after)
 	if err != nil {
-		return nil, fmt.Errorf("graudit: diff: normalize after: %w", err)
+		return nil, fmt.Errorf("%w: diff: normalize after: %v", ErrInvalidEvent, err)
 	}
 
 	diff := ChangeDiff{}

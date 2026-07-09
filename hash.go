@@ -29,10 +29,22 @@ import (
 //   - actorID, entityType, entityID, action: string — included verbatim
 //   - payload: any — normalized via canonicalJSON before hashing (see its
 //     doc comment for the determinism guarantee); may be nil
-//   - timestamp: time.Time — encoded as time.RFC3339Nano in UTC, not Go's
-//     default String()/MarshalJSON, both of which are timezone- and
-//     precision-sensitive in ways that would make this hash
-//     non-deterministic for the "same" logical timestamp
+//   - timestamp: time.Time — truncated to millisecond precision and encoded
+//     as time.RFC3339Nano in UTC, not Go's default String()/MarshalJSON
+//     (both timezone-sensitive) and not full nanosecond precision. The
+//     millisecond truncation is deliberate and load-bearing, not
+//     cosmetic: MongoDB's BSON datetime type only stores millisecond
+//     precision, so a hash computed from a Go time.Time's full nanosecond
+//     value would never match the hash recomputed from that same entry
+//     after a round trip through graudit/mongo's storage — Verify() would
+//     falsely report every entry as tampered. Truncating here, inside the
+//     one function every backend calls, makes hash determinism hold
+//     regardless of which backend's storage precision is coarser than
+//     Go's in-memory time.Time (Mongo: millisecond; Postgres: microsecond,
+//     still coarser than nanosecond; memory: no serialization loss at
+//     all) — every backend's storage preserves at least millisecond
+//     precision, so truncating to that floor here is always safe and
+//     always idempotent across a store/read-back round trip.
 //   - prevHash: string — the previous entry's Hash, or GenesisPrevHash for
 //     entry #1
 //
@@ -53,7 +65,7 @@ func ComputeHash(entryID EntryID, actorID, entityType, entityID, action string, 
 	buf.WriteString(entityID)
 	buf.WriteString(action)
 	buf.Write(canon)
-	buf.WriteString(timestamp.UTC().Format(time.RFC3339Nano))
+	buf.WriteString(timestamp.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano))
 	buf.WriteString(prevHash)
 
 	sum := sha256.Sum256(buf.Bytes())

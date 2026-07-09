@@ -116,6 +116,47 @@ func TestComputeHash_DifferentPrevHashProducesDifferentHash(t *testing.T) {
 	}
 }
 
+func TestComputeHash_TruncatesSubMillisecondPrecision(t *testing.T) {
+	// Regression test: MongoDB's BSON datetime type only stores millisecond
+	// precision, so a hash computed from a Go time.Time's full nanosecond
+	// value would never match the hash recomputed after a round trip
+	// through graudit/mongo's storage (which necessarily truncates to
+	// millisecond) — Verify() would falsely report every entry as
+	// tampered. ComputeHash must produce identical output for two
+	// timestamps that differ only below the millisecond digit.
+	base := time.Date(2026, 7, 9, 12, 0, 0, 123_000_000, time.UTC) // .123 exactly
+	withNanoNoise := base.Add(456_789 * time.Nanosecond)           // .123456789, same millisecond
+
+	hash1, err := ComputeHash(1, "a", "t", "1", "create", nil, base, GenesisPrevHash)
+	if err != nil {
+		t.Fatalf("ComputeHash: %v", err)
+	}
+	hash2, err := ComputeHash(1, "a", "t", "1", "create", nil, withNanoNoise, GenesisPrevHash)
+	if err != nil {
+		t.Fatalf("ComputeHash: %v", err)
+	}
+	if hash1 != hash2 {
+		t.Fatalf("expected identical hashes for timestamps in the same millisecond, got %q vs %q", hash1, hash2)
+	}
+}
+
+func TestComputeHash_DifferentMillisecondProducesDifferentHash(t *testing.T) {
+	ts1 := time.Date(2026, 7, 9, 12, 0, 0, 123_000_000, time.UTC)
+	ts2 := time.Date(2026, 7, 9, 12, 0, 0, 124_000_000, time.UTC)
+
+	hash1, err := ComputeHash(1, "a", "t", "1", "create", nil, ts1, GenesisPrevHash)
+	if err != nil {
+		t.Fatalf("ComputeHash: %v", err)
+	}
+	hash2, err := ComputeHash(1, "a", "t", "1", "create", nil, ts2, GenesisPrevHash)
+	if err != nil {
+		t.Fatalf("ComputeHash: %v", err)
+	}
+	if hash1 == hash2 {
+		t.Fatalf("expected different hashes for different milliseconds, both got %q", hash1)
+	}
+}
+
 func TestComputeHash_NilPayload(t *testing.T) {
 	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	if _, err := ComputeHash(1, "actor", "entity", "id", "create", nil, ts, GenesisPrevHash); err != nil {

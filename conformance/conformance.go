@@ -15,6 +15,7 @@ package conformance
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -347,9 +348,21 @@ func testRecordChangeDiff(t *testing.T, newLog NewLogFunc) {
 		t.Fatalf("Query returned %+v, want one entry with ID %d", entries, id)
 	}
 
-	diff, ok := entries[0].Payload.(graudit.ChangeDiff)
-	if !ok {
-		t.Fatalf("Payload type = %T, want graudit.ChangeDiff", entries[0].Payload)
+	// Payload's concrete Go type depends on the backend: memory preserves
+	// the original graudit.ChangeDiff value in-process, while postgres/
+	// mongo round-trip it through JSON storage and hand back a generic
+	// map[string]any (DecodeStoredPayload has no way to know the original
+	// concrete type was ChangeDiff — only the JSON shape survives). Both
+	// are correct, expected backend-specific behavior, not a bug, so this
+	// assertion normalizes through JSON rather than asserting a concrete
+	// Go type.
+	raw, err := json.Marshal(entries[0].Payload)
+	if err != nil {
+		t.Fatalf("marshal Payload for inspection: %v", err)
+	}
+	var diff map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &diff); err != nil {
+		t.Fatalf("Payload did not marshal to a JSON object: %v (raw: %s)", err, raw)
 	}
 	if _, ok := diff["name"]; ok {
 		t.Fatal("unchanged field \"name\" should not appear in the diff")
@@ -371,13 +384,19 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 	}
 	defer log.Close()
 
-	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create"}); err != nil {
+	// Explicit, well-separated timestamps (not time.Now()) so the From/To
+	// range assertions below are deterministic even under a backend whose
+	// storage only preserves millisecond precision (graudit/mongo) —
+	// three real time.Now() calls in a tight loop can land in the same
+	// millisecond and make the range filters indistinguishable.
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create", Timestamp: base}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:2", EntityType: "widget", EntityID: "w2", Action: "create"}); err != nil {
+	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:2", EntityType: "widget", EntityID: "w2", Action: "create", Timestamp: base.Add(time.Minute)}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "gadget", EntityID: "g1", Action: "create"}); err != nil {
+	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "gadget", EntityID: "g1", Action: "create", Timestamp: base.Add(2 * time.Minute)}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
@@ -403,6 +422,39 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 	}
 	if len(limited) != 1 {
 		t.Fatalf("Query(Limit=1) returned %d entries, want 1", len(limited))
+	}
+
+	all, err := log.Query(ctx, graudit.QueryFilter{})
+	if err != nil {
+		t.Fatalf("Query(all): %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("Query(all) returned %d entries, want 3", len(all))
+	}
+	mid := all[1].Timestamp
+
+	byFrom, err := log.Query(ctx, graudit.QueryFilter{From: mid})
+	if err != nil {
+		t.Fatalf("Query(From): %v", err)
+	}
+	if len(byFrom) != 2 {
+		t.Fatalf("Query(From=entry[1].Timestamp) returned %d entries, want 2", len(byFrom))
+	}
+
+	byTo, err := log.Query(ctx, graudit.QueryFilter{To: mid})
+	if err != nil {
+		t.Fatalf("Query(To): %v", err)
+	}
+	if len(byTo) != 2 {
+		t.Fatalf("Query(To=entry[1].Timestamp) returned %d entries, want 2", len(byTo))
+	}
+
+	byRange, err := log.Query(ctx, graudit.QueryFilter{From: mid, To: mid})
+	if err != nil {
+		t.Fatalf("Query(From,To): %v", err)
+	}
+	if len(byRange) != 1 {
+		t.Fatalf("Query(From=To=entry[1].Timestamp) returned %d entries, want 1", len(byRange))
 	}
 }
 
