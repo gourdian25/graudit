@@ -2,195 +2,156 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current state: pre-implementation, and possibly pre-approval
+## Overview
 
-This repository contains **no Go code yet** — `go.mod` exists (module
-`github.com/gourdian25/graudit`, Go 1.26.4) and the `bark` file-header tool is
-configured (`.bark.toml`), but there are no `.go` files and no Makefile. The
-only substantive content is [docs/plan/graudit-plan.md](docs/plan/graudit-plan.md),
-a detailed scope/spec document. Read it in full before writing any code —
-this file only summarizes it.
+graudit (`github.com/gourdian25/graudit`) is an append-only, tamper-evident
+audit trail for the gourdian ecosystem — it answers "what changed, who did
+it, and can we prove the record hasn't been altered," a different question
+from what [grlog](https://github.com/gourdian25/grlog) answers ("what
+happened during this request"). Like `grcache`, it uses one subpackage per
+storage backend (`graudit/memory`, `graudit/postgres`, `graudit/mongo`) so a
+consumer using only one backend doesn't pull in the others' client
+libraries. Read `docs/architecture.md` for the deliberate divergences from
+sibling conventions (why Postgres doesn't use `SERIAL` for `EntryID`, why
+Mongo requires a replica set unconditionally, `Verify()`'s two-check
+design) before "fixing" something that looks inconsistent with `grcache`.
 
-**Before anything else, read plan doc §0.** graudit was flagged from the
-start as a strong "Defer" candidate — hash-chaining and tamper detection are
-architecturally closer to a minimal blockchain than to any sibling repo, and
-§0 requires answering three questions (does `gourdianerp` have a real feature
-needing this today, is there an actual compliance driver, is this the best
-use of time vs. `grauth`/`grpolicy`) before producing an implementation plan.
-If asked to "build graudit" or "implement the plan," restate the §0
-assessment explicitly first rather than jumping straight to code — that is
-what the plan doc itself instructs (§9.1).
+**Precise, non-aspirational claim (preserved everywhere — code comments,
+README, docs.go, SECURITY.md):** hash-chaining proves internal consistency
+(nothing was altered/removed without `Verify()` detecting it) but does
+**not** prove *who* wrote an entry beyond the caller-supplied `ActorID`, and
+does **not** protect against a privileged attacker with direct DB access
+regenerating the entire chain from scratch. Do not let "tamper-evident" read
+as "cryptographically un-forgeable" in any documentation change.
 
-## Mandatory pre-implementation research
+## Commands
 
-If §0 concludes this should proceed, the plan requires reading these sibling
-repos **in full** first, because graudit is meant to reuse their patterns
-rather than reinvent them:
-
-- **`~/Dev/gourdian25/grevents`** — graudit is the first repo in the
-  ecosystem with a genuine *functional* dependency on another gourdian repo
-  (not just a borrowed pattern): `Record()` must publish an event via
-  `Bus.Publish` after a successful write. Confirm the exact `Publish`
-  signature and decide the topic name (e.g. `"audit.entry.recorded"`) before
-  writing `events.go`.
-- **`~/Dev/gourdian25/grcache`** — study its subpackage-per-backend layout
-  (why `graudit/postgres` and `graudit/memory` should follow the same
-  reasoning: don't force every consumer to pull in a DB driver they don't
-  use), its `Close()` idempotency (`sync.Once`), sentinel-error style, optional
-  structural `Logger` interface, and `conformance/` shared test suite — all
-  four carry over unchanged. Also read its CHANGELOG's `Pipeline` vs
-  `TxPipeline` finding: graudit's own "tamper-evident"/"immutable" claims need
-  the same scrutiny — don't let the README claim more than `Verify()` actually
-  enforces.
-- **`~/Dev/gourdian25/grlog`** and **`~/Dev/gourdian25/gourdiantoken`** — for
-  sentinel error conventions and the background-sweep-goroutine pattern
-  relevant to retention/archival of old audit entries.
-
-Only after these reads should an implementation plan be produced — see plan
-doc §9 for the specific questions to answer (serialization strategy choice,
-canonical JSON determinism proof, exact grevents topic name, a working
-deliberate-tamper test shown before claiming `Verify()` works).
-
-## What graudit is
-
-An append-only, tamper-evident audit trail — it answers "what changed, who
-did it, and can we prove the record hasn't been altered," which is a
-different question from what `grlog` answers ("what happened during this
-request"). It is not a logging library and not a compliance certification
-product; it's one component that could contribute to SOC2/HIPAA/PCI
-readiness, not the whole solution.
-
-**Precise, non-aspirational claim to preserve everywhere (code comments,
-README, doc.go):** hash-chaining proves internal consistency (nothing was
-altered/removed without `Verify()` detecting it) but does **not** prove *who*
-wrote an entry beyond the caller-supplied `ActorID`, and does **not** protect
-against a privileged attacker with direct DB access regenerating the entire
-chain from scratch. A hash chain only detects partial tampering, not
-wholesale regeneration by someone who controls the storage.
-
-## Planned public API (from the plan doc — subject to revision during implementation)
-
-```go
-package graudit
-
-type AuditLog interface {
-	Record(ctx context.Context, event AuditEvent) (EntryID, error)
-	RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error)
-	Verify(ctx context.Context, from, to EntryID) (ok bool, detail VerifyResult, err error)
-	Query(ctx context.Context, filter QueryFilter) ([]AuditEvent, error)
-	Close() error
-}
+```sh
+make test             # go test -cover ./...
+make race             # go test -race ./...  (mandatory before any commit touching the hash-chain or serialization code)
+make coverage         # HTML coverage report
+make coverage-check   # verify each package independently meets 80% coverage
+make bench            # go test -bench=. -benchmem -benchtime=10s ./...
+make lint             # golangci-lint run ./...
+make vet              # go vet ./...
+make fmt              # gofmt
+make release VERSION=vX.Y.Z   # tag, push, goreleaser release --clean
+make goreleaser-check         # dry run: goreleaser check + --snapshot --clean
 ```
 
-`EntryID` is a strictly increasing `uint64` chain position, not a UUID.
-`AuditEvent.Hash`/`PrevHash` are set by `Record`; the genesis entry has
-`PrevHash = ""` (or a documented 64-zero-char constant) — `Verify()` must
-treat entry #1 as a special case. Full field-level signatures are in plan
-doc §4.1.
+Run a single test: `go test -run TestConformance/ConcurrentRecordStress ./postgres/...` (or `./memory/...`, `./mongo/...`).
 
-## The hard problem: single-writer serialization
+### Backend tests require live local services
 
-Each entry's hash depends on the immediately preceding entry's hash, so
-concurrent `Record()` calls against the same chain **cannot** run without a
-serialization point, or the chain corrupts. Plan doc §4.2 lays out two
-candidates and recommends the first:
+`postgres` and `mongo` need a real running service — no mocks, mirroring
+every sibling repo's testing philosophy. `memory` needs nothing.
 
-- **DB-level serialization** (recommended): `SELECT ... FOR UPDATE` on the
-  latest-entry row, or `pg_advisory_xact_lock`, inside the same transaction
-  that inserts the new entry. Correct even across multiple `gourdianerp`
-  replicas talking to the same Postgres instance — an in-process mutex is
-  not.
-- **Application-level single-writer goroutine**: simple, correct only within
-  one process. Fragile if `gourdianerp` ever runs more than one replica, so
-  treat this as the memory backend's approach only (plain `sync.Mutex`,
-  test/dev-only, single-process by definition), not the Postgres backend's.
+```sh
+docker run -d --name graudit-postgres -p 5432:5432 \
+  -e POSTGRES_USER=postgres_user -e POSTGRES_PASSWORD=postgres_password postgres:16
+createdb -U postgres_user -h localhost graudit_test
 
-This is the single hardest and most safety-critical piece of the repo —
-validate the recommendation against the actual Postgres backend rather than
-assuming it.
+# No auth env vars — MONGO_INITDB_ROOT_USERNAME/PASSWORD enables auth,
+# which requires a keyFile once --replSet is also set. Unnecessary for a
+# local test replica set.
+docker run -d --name graudit-mongo -p 27018:27017 mongo:7 --replSet rs0
+docker exec graudit-mongo mongosh --eval 'rs.initiate()'
 
-## Hash computation
-
-```
-hash = SHA256(entryID || actorID || entityType || entityID || action ||
-              canonicalJSON(payload) || timestamp || prevHash)
+# A second, genuinely standalone (no --replSet) instance is also required —
+# TestNewMongoAuditLog_RequiresReplicaSet in mongo/mongo_test.go needs it,
+# and must never be skipped/reverted to skipping: a pre-v0.1.0 audit found
+# that probeTransactionSupport's original no-op transaction body never sent
+# a real transaction-start command to the server, so it silently reported
+# "transactions supported" even against a standalone deployment — this
+# test is the only thing that catches that class of bug. Fixed by making
+# the probe perform a real (self-cleaning) write inside the transaction.
+docker run -d --name graudit-mongo-standalone -p 27019:27017 mongo:7
 ```
 
-Go's `encoding/json` on `map[string]any` does not guarantee key order across
-runs by default — confirm whatever canonical-encoding approach is chosen
-actually produces a stable byte sequence for logically-identical payloads
-(same keys, different insertion order), or `Verify()` will falsely report
-tampering. This determinism claim needs its own explicit test before it's
-trusted (plan doc §6).
+The Mongo backend **requires** the instance to be a replica set (single-node
+is sufficient) — `NewMongoAuditLog` fails fast, wrapping
+`ErrReplicaSetRequired`, against a standalone instance. This is a hard
+requirement (correctness, not just consistency-under-load — see
+`docs/architecture.md`), unlike gourdiantoken's optional `useTransactions
+bool` escape hatch.
 
-## Planned architecture
+## Architecture
 
-```
-graudit/
-├── audit.go              // AuditLog interface, AuditEvent, EntryID, QueryFilter, VerifyResult
-├── hash.go                // hash computation + canonical JSON encoding, isolated for independent testing
-├── diff.go                // snapshot diff engine used by RecordChange
-├── errors.go
-├── postgres/
-│   └── postgres.go        // primary durable backend; owns the serialization strategy above
-├── memory/
-│   └── memory.go           // test/dev-only backend; sync.Mutex-serialized, never for anything you need to keep
-├── events.go               // grevents integration: what gets published, topic naming
-└── conformance/
-    └── conformance.go       // shared suite: hash-chain integrity, tamper detection, concurrent Record() ordering, Verify() on a deliberately-corrupted chain
-```
+- **Root package (`graudit`)** — `audit.go` (`AuditLog` interface,
+  `AuditEvent`, `EntryID`, `QueryFilter`, `VerifyResult`,
+  `GenesisPrevHash`); `hash.go` (`ComputeHash` — exported so all three
+  backends compute hashes identically — plus the canonical-JSON encoder
+  isolated for independent testing); `diff.go` (`RecordChange`'s
+  before/after diff engine, `ChangeDiff`/`FieldDiff`, `BuildChangeEvent`);
+  `errors.go` (sentinels); `logger.go` (optional structural `Logger`
+  interface, `NopLogger`/`OrNop`); `events.go` (`TopicAuditRecorded`,
+  `PublishRecorded` — the grevents integration every backend calls once);
+  `docs.go` (package godoc only). All stdlib-only except `events.go`
+  (imports `grevents` for the `Bus`/`Event` types).
+- **`memory/`** — test/dev only, never for anything you need to keep. A
+  single `sync.Mutex` is both the storage guard and the chain's
+  serialization point. Takes functional options (`WithLogger`,
+  `WithEventBus`), not a Config struct.
+- **`postgres/`** — production-eligible, via GORM. Chain serialization is a
+  `pg_advisory_xact_lock` held for the transaction that reads the tail and
+  inserts the new entry; `EntryID` is explicitly assigned inside that
+  transaction, **never** a `SERIAL`/`BIGSERIAL` column (a sequence advances
+  even on rollback, silently creating a gap that would be indistinguishable
+  from tampering).
+- **`mongo/`** — production-eligible, via `go.mongodb.org/mongo-driver`
+  **v1** (not `/v2` — breaking rewrite, out of scope). Chain serialization
+  is a multi-document ACID transaction (`session.WithTransaction`) covering
+  a singleton chain-state document (`<collection>_chain_state`) and the new
+  entry's insert. No TTL index anywhere — unlike `grcache/mongo`, audit
+  entries are never expired.
+- **`conformance/`** — a shared behavioral test suite
+  (`conformance.Run(t, newLog, newLogWithBus, opts...)`) every backend's own
+  `_test.go` calls with its own constructor closures. Imports only the root
+  `graudit` package, never a backend subpackage (avoids the same
+  import-cycle problem grcache's design avoids). 11 scenarios per backend,
+  including the two most important tests in the repo:
+  `ConcurrentRecordStress` (proves the serialization strategy actually
+  works under real concurrent `Record()` calls) and `VerifyDetectsTamper`
+  (proves `Verify()`'s tamper-detection claim against a backend-specific
+  `WithTamperHook` that bypasses the API entirely — raw SQL for postgres,
+  raw driver call for mongo, direct struct mutation for memory).
+- **`example/`** — a runnable demo (`go run ./example`, zero setup) against
+  the memory backend, including `WithLogger(grlog.NewDefaultLogger())`.
+- **Logging** — every backend's `Config` (or, for `memory`,
+  `WithLogger(...)`) accepts an optional `graudit.Logger`. `*grlog.Logger`
+  satisfies it with no adapter; `grlog` is used only in this module's own
+  test files (`logger_test.go`, each backend's `TestWithLogger`/
+  `TestNewPostgresAuditLog_FullConfig`-style tests) to prove this, and is
+  never a dependency of any backend's non-test code.
+- **grevents** — a real functional dependency, not just a borrowed pattern:
+  every backend calls `graudit.PublishRecorded` once after its durable
+  write commits, publishing one `"audit.recorded"` event (two segments,
+  matching the real `resource.pastTenseVerb` convention). A nil/
+  unconfigured `EventBus` or a publish failure never fails `Record` — the
+  durable write is the guarantee, grevents delivery is best-effort.
 
-## Explicitly out of scope for v1 (resist scope creep here)
+## Testing conventions
 
-- Full SOC2/HIPAA/PCI/ISO certification tooling.
-- Real-time alerting (that's grevents'/a consumer's job — graudit only
-  publishes after recording, never evaluates rules or notifies).
-- Auto-instrumentation/middleware that intercepts `grauth` calls to generate
-  entries automatically — every entry comes from an explicit `Record()` call.
-- Storage backends beyond Postgres + in-memory (no Mongo, no Redis-backed
-  audit storage — an audit trail in a cache that can evict entries is a
-  contradiction).
-- Cryptographic per-entry signatures (true non-repudiation) — see the
-  precise claim above about what hash-chaining does and doesn't prove.
+Real local services, no mocks, `-race` mandatory (the concurrent-write
+stress test and every backend's serialization strategy depend on it).
+Coverage is checked **per-package**, not just in aggregate — `make
+coverage-check` fails if any single package (root, `memory`, `postgres`,
+`mongo`) drops below 80%. `conformance` and `example` are excluded (no
+`_test.go` of its own / not library code under test).
 
-## Testing strategy (needs more adversarial testing than any prior sibling repo)
+## Repo conventions
 
-- **Concurrent `Record()` stress test** — the most important test in the
-  repo: fire N concurrent `Record()` calls at the same chain, confirm every
-  entry got a unique strictly-sequential `EntryID` and `Verify()` passes
-  afterward. Directly validates the §4.2 serialization strategy actually
-  works, not just that it compiles.
-- **Deliberate tamper test** — write N entries, mutate one entry's payload
-  directly in the underlying Postgres table (bypassing graudit's API), call
-  `Verify()`, confirm `Valid: false` with the correct `BrokenAt` ID.
-- **Hash determinism test** — two `AuditEvent`s with logically identical
-  payloads but different map key insertion order must hash identically.
-- **Genesis entry test** — `Verify()` on a chain of length 1.
-- Race detector mandatory, same as every sibling repo.
-
-## Dependencies
-
-- `grevents` — real functional dependency: `Record()` publishes on success.
-- `grlog` — optional structural `Logger`, same pattern as siblings.
-- `grcache` — optional, read-path only (caching `Query()` results); never
-  used to cache or skip a `Record()` write, since that would undermine
-  durability. A v1.x nice-to-have, not required for correctness.
-- PostgreSQL driver (GORM, matching grcache's Postgres backend, for
-  ecosystem consistency).
-
-## Sibling repo conventions to match once code exists
-
-- Module path is `github.com/gourdian25/graudit`; subpackage-per-backend
-  (`postgres/`, `memory/`) following grcache's reasoning, unlike grlog's/
-  gourdiantoken's flat single-package layout.
-- Source files use a `// File: <relative-path>` header maintained by the
-  `bark` tool (`.bark.toml` already present in this repo).
-- Expect a `Makefile` with targets equivalent to siblings' `test`, `race`
-  (mandatory), `bench`, `lint`, `coverage-check`, `release VERSION=vX.Y.Z`.
+- Every `.go` file (and the `Makefile`) starts with a `// File:
+  <relative-path>` header line, maintained by the `bark` tool
+  (`.bark.toml`). Run `bark check` before committing; `bark tag` to fix.
+- `docs/plan/graudit-plan.md` is the original scope/spec document this repo
+  was built from; treat it as historical context, not a live source of
+  truth for current behavior (the actual code, this file, and
+  `docs/architecture.md` are authoritative) — matching how grcache's and
+  grevents' own CLAUDE.md files treat their plan docs once code exists.
 - Sentinel errors: `errors.Is`-compatible, defined once in `errors.go`, no
-  `IsX(err) bool` helpers.
-- `Close()` idempotent via `sync.Once`, matching grlog/grcache/gourdiantoken.
-- `docs.go` for package-level godoc only, no logic.
-- Once implementation exists, treat `docs/plan/graudit-plan.md` as
-  historical context (matching grcache's/grevents' own CLAUDE.md treatment
-  of their plan docs) — the actual code and this file become authoritative.
+  `IsX(err) bool` helper functions.
+- `Close()` is idempotent (`sync.Once` + `atomic.Bool`), matching every
+  sibling repo.
+- No `.github/workflows/` — consistent with every sibling repo's actual
+  state (a real ecosystem gap, not something to fix here specifically).
