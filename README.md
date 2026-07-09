@@ -108,6 +108,29 @@ auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
 })
 ```
 
+## Logger
+
+Every backend accepts an optional `graudit.Logger` (`Infof`/`Warnf`/`Errorf`)
+for diagnostic messages — connection failures, grevents publish failures,
+shutdown. A `nil` Logger (the default) means graudit logs nothing.
+[`*grlog.Logger`](https://github.com/gourdian25/grlog) satisfies this
+interface with no adapter, the same pattern grcache uses — see
+`logger_test.go`'s `TestGrlogSatisfiesLoggerInterface` for the compile+run
+proof, and [example/example.go](example/example.go) for a runnable demo.
+
+```go
+import "github.com/gourdian25/grlog"
+
+logger := grlog.NewDefaultLogger()
+auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+	DSN:    dsn,
+	Logger: logger, // *grlog.Logger satisfies graudit.Logger directly
+})
+
+// memory takes an Option instead of a Config field:
+auditLog, err := memory.NewMemoryAuditLog(memory.WithLogger(logger))
+```
+
 ## `Verify()` semantics
 
 ```go
@@ -136,10 +159,13 @@ docker run -d --name graudit-postgres -p 5432:5432 \
   -e POSTGRES_USER=postgres_user -e POSTGRES_PASSWORD=postgres_password postgres:16
 createdb -U postgres_user -h localhost graudit_test
 
-docker run -d --name graudit-mongo -p 27018:27017 \
-  -e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=mongo_password \
-  mongo:7 --replSet rs0
-docker exec graudit-mongo mongosh -u root -p mongo_password --eval 'rs.initiate()'
+# No auth env vars: MONGO_INITDB_ROOT_USERNAME/PASSWORD enables auth, which
+# requires a keyFile once --replSet is also set ("security.keyFile is
+# required when authorization is enabled with replica sets") — unnecessary
+# complexity for a local test replica set, so this container runs without
+# auth.
+docker run -d --name graudit-mongo -p 27018:27017 mongo:7 --replSet rs0
+docker exec graudit-mongo mongosh --eval 'rs.initiate()'
 ```
 
 The Mongo backend additionally requires the instance to be configured as a

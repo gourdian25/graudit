@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/gourdian25/grevents v0.1.0
+	github.com/gourdian25/grlog v0.1.0
 	go.mongodb.org/mongo-driver v1.17.9
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.2

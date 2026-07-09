@@ -160,6 +160,9 @@ func NewPostgresAuditLog(cfg PostgresConfig) (graudit.AuditLog, error) {
 	return &AuditLog{db: db, logger: appLogger, bus: cfg.EventBus}, nil
 }
 
+// Record implements graudit.AuditLog.Record; see the interface's doc
+// comment for the full contract and the package doc comment for the
+// pg_advisory_xact_lock-based serialization strategy.
 func (a *AuditLog) Record(ctx context.Context, event graudit.AuditEvent) (graudit.EntryID, error) {
 	if a.closed.Load() {
 		return 0, graudit.ErrClosed
@@ -224,6 +227,8 @@ func (a *AuditLog) Record(ctx context.Context, event graudit.AuditEvent) (graudi
 	return recorded.ID, nil
 }
 
+// RecordChange implements graudit.AuditLog.RecordChange; see the
+// interface's doc comment for the full contract.
 func (a *AuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (graudit.EntryID, error) {
 	event, err := graudit.BuildChangeEvent(actorID, entityType, entityID, before, after)
 	if err != nil {
@@ -283,6 +288,8 @@ func (a *AuditLog) Verify(ctx context.Context, from, to graudit.EntryID) (bool, 
 	return true, graudit.VerifyResult{Valid: true}, nil
 }
 
+// Query implements graudit.AuditLog.Query; see the interface's doc comment
+// for the full contract.
 func (a *AuditLog) Query(ctx context.Context, filter graudit.QueryFilter) ([]graudit.AuditEvent, error) {
 	if a.closed.Load() {
 		return nil, graudit.ErrClosed
@@ -324,6 +331,7 @@ func (a *AuditLog) Query(ctx context.Context, filter graudit.QueryFilter) ([]gra
 	return out, nil
 }
 
+// Close implements graudit.AuditLog.Close; idempotent via sync.Once.
 func (a *AuditLog) Close() error {
 	var err error
 	a.closeOnce.Do(func() {

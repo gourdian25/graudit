@@ -1,8 +1,9 @@
 // File: example/example.go
 
 // Command example is a runnable demonstration of graudit against the
-// memory backend (zero external dependencies, so `go run` works with no
-// setup). See the commented block at the bottom for the postgres/mongo
+// memory backend (no live services required, so `go run` works with no
+// setup — grlog is a lightweight in-process logger, not an external
+// service). See the commented block at the bottom for the postgres/mongo
 // equivalents.
 package main
 
@@ -11,12 +12,30 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/gourdian25/grevents"
+	"github.com/gourdian25/grlog"
+
 	"github.com/gourdian25/graudit"
 	"github.com/gourdian25/graudit/memory"
 )
 
 func main() {
-	auditLog, err := memory.NewMemoryAuditLog()
+	// *grlog.Logger satisfies graudit.Logger with no adapter — see
+	// logger_test.go's TestGrlogSatisfiesLoggerInterface for the
+	// compile+run proof. Connection failures, grevents publish failures,
+	// and shutdown all get logged through it; a nil Logger (the default)
+	// means graudit logs nothing.
+	logger := grlog.NewDefaultLogger()
+
+	// A bus closed before use, purely to make the logger visibly fire
+	// below: PublishRecorded logs (via Warnf) and swallows any publish
+	// error rather than failing Record — the durable write is graudit's
+	// guarantee, grevents delivery is a best-effort side channel on top of
+	// it. A real application would pass a live, running Bus here instead.
+	bus, _ := grevents.NewBus()
+	_ = bus.Close()
+
+	auditLog, err := memory.NewMemoryAuditLog(memory.WithLogger(logger), memory.WithEventBus(bus))
 	if err != nil {
 		log.Fatal(err)
 	}

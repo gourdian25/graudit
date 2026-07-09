@@ -36,7 +36,10 @@
 //   - Sentinel errors (ErrClosed, ErrInvalidEvent, ErrBackendUnavailable,
 //     ...) usable with errors.Is
 //   - Optional diagnostic logging via any logger satisfying the small
-//     Logger interface — grlog.Logger works with no adapter
+//     Logger interface — *grlog.Logger satisfies it with no adapter
+//     (proven at compile+run time by logger_test.go's
+//     TestGrlogSatisfiesLoggerInterface, mirroring grcache's own
+//     logger_test.go)
 //
 // Getting Started:
 //
@@ -71,6 +74,11 @@
 //
 // Each backend lives in its own importable subpackage so that consumers who
 // only need one backend don't pull in the other backends' client libraries.
+//
+// The first entry in every chain (EntryID 1) has PrevHash set to the
+// exported GenesisPrevHash constant (64 zero characters, matching SHA-256's
+// hex output length) rather than an empty string — Verify treats this as
+// the documented base case, not a special "entry #0."
 //
 //  1. In-memory (graudit/memory) — test/dev only, never for anything you
 //     need to keep. Single-process; a sync.Mutex is both the storage guard
