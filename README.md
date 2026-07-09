@@ -166,6 +166,14 @@ createdb -U postgres_user -h localhost graudit_test
 # auth.
 docker run -d --name graudit-mongo -p 27018:27017 mongo:7 --replSet rs0
 docker exec graudit-mongo mongosh --eval 'rs.initiate()'
+
+# A second, genuinely standalone (no --replSet) instance, required by
+# TestNewMongoAuditLog_RequiresReplicaSet — the one test that actually
+# proves construction fails fast against a non-replica-set deployment
+# (see mongo/mongo_test.go's comment for why this test must never be
+# skipped: an earlier version of this exact test caught a real bug where
+# the fail-fast check silently passed against a standalone instance).
+docker run -d --name graudit-mongo-standalone -p 27019:27017 mongo:7
 ```
 
 The Mongo backend additionally requires the instance to be configured as a

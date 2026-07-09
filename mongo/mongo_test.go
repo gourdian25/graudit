@@ -102,23 +102,29 @@ func TestNewMongoAuditLog_MissingDatabase(t *testing.T) {
 	}
 }
 
-// TestNewMongoAuditLog_RequiresReplicaSet documents (rather than
-// independently re-verifies against a second standalone container) that
-// construction fails fast against a non-replica-set deployment: the
-// transaction probe in NewMongoAuditLog relies on the MongoDB driver's own
-// documented rejection of StartTransaction on a standalone instance,
-// wrapped as graudit.ErrReplicaSetRequired. Standing up a second, separate
-// standalone Mongo container purely for this negative test is unnecessary
-// infrastructure for what the driver already guarantees; this test instead
-// exercises the wrapping/error-path logic against an unreachable URI (a
-// standalone instance behaves identically to an unreachable one from
-// probeTransactionSupport's perspective: WithTransaction fails and
-// NewMongoAuditLog returns ErrReplicaSetRequired only when Ping/Connect
-// already succeeded, so this specific assertion needs a real non-replica-set
-// server to observe — skipped when only the replica-set test container is
-// available).
+// standaloneURI must point at a plain, non-replica-set MongoDB instance —
+// deliberately distinct from testURI. A pre-release audit of this exact
+// test (previously skipped, see git history) found a real bug this way:
+// probeTransactionSupport's original no-op transaction body never sent an
+// actual transaction-start command to the server, so it silently
+// "succeeded" even against a standalone deployment — MongoDB only rejects
+// a transaction with "Transaction numbers are only allowed on a replica
+// set member or mongos" once a real operation is attempted inside one, not
+// on StartTransaction/CommitTransaction alone. Do not re-skip this test;
+// it is the only thing that would have caught that bug.
+//
+//	docker run -d --name graudit-mongo-standalone -p 27019:27017 mongo:7
+const standaloneURI = "mongodb://localhost:27019/?directConnection=true"
+
 func TestNewMongoAuditLog_RequiresReplicaSet(t *testing.T) {
-	t.Skip("requires a second, standalone (non-replica-set) MongoDB instance not provisioned in this environment; NewMongoAuditLog's fail-fast path is implemented via probeTransactionSupport, see mongo.go")
+	log, err := graudmongo.NewMongoAuditLog(graudmongo.MongoConfig{URI: standaloneURI, Database: "graudit_standalone_test"})
+	if err == nil {
+		_ = log.Close()
+		t.Fatal("expected NewMongoAuditLog to fail against a standalone (non-replica-set) instance, got nil error")
+	}
+	if !errors.Is(err, graudit.ErrReplicaSetRequired) {
+		t.Fatalf("error = %v, want wrapping graudit.ErrReplicaSetRequired", err)
+	}
 }
 
 func TestNewMongoAuditLog_CustomCollectionAndLogger(t *testing.T) {

@@ -56,6 +56,16 @@ createdb -U postgres_user -h localhost graudit_test
 # local test replica set.
 docker run -d --name graudit-mongo -p 27018:27017 mongo:7 --replSet rs0
 docker exec graudit-mongo mongosh --eval 'rs.initiate()'
+
+# A second, genuinely standalone (no --replSet) instance is also required —
+# TestNewMongoAuditLog_RequiresReplicaSet in mongo/mongo_test.go needs it,
+# and must never be skipped/reverted to skipping: a pre-v0.1.0 audit found
+# that probeTransactionSupport's original no-op transaction body never sent
+# a real transaction-start command to the server, so it silently reported
+# "transactions supported" even against a standalone deployment — this
+# test is the only thing that catches that class of bug. Fixed by making
+# the probe perform a real (self-cleaning) write inside the transaction.
+docker run -d --name graudit-mongo-standalone -p 27019:27017 mongo:7
 ```
 
 The Mongo backend **requires** the instance to be a replica set (single-node

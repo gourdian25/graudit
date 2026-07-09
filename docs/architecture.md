@@ -30,6 +30,23 @@ concurrent `Record()` calls interleave in a way that corrupts the chain, so
 construction fails fast (wrapping `ErrReplicaSetRequired`) against a
 standalone deployment rather than silently degrading to a weaker mode.
 
+**The fail-fast probe must perform a real operation, not a no-op.** A
+pre-v0.1.0 audit found that `probeTransactionSupport`'s original
+implementation ran a transaction whose body did nothing
+(`return nil, nil`) — the MongoDB driver never sends an actual
+transaction-start command to the server until a real operation is
+attempted inside the transaction, so the no-op probe silently reported
+"transactions supported" even against a genuinely standalone deployment.
+Confirmed empirically: MongoDB only rejects a transaction with
+`"Transaction numbers are only allowed on a replica set member or
+mongos"` once a real read/write is attempted inside it. The fix inserts
+and deletes a throwaway document (under a reserved `_id`, distinct from
+the real `"tail"` chain-state document) inside the probe transaction, so
+the check is real but nothing persists either way. See
+`mongo/mongo_test.go`'s `TestNewMongoAuditLog_RequiresReplicaSet` — this
+test must never be reverted to `t.Skip`, since it is the only thing that
+catches a regression of this exact bug.
+
 ## No TTL index in `graudit/mongo`
 
 `grcache/mongo` uses a TTL index (`expireAfterSeconds: 0`) as its native

@@ -163,15 +163,15 @@ func NewMongoAuditLog(cfg MongoConfig) (graudit.AuditLog, error) {
 		return nil, fmt.Errorf("graudit/mongo: ping: %w", graudit.ErrBackendUnavailable)
 	}
 
-	if err := probeTransactionSupport(ctx, client); err != nil {
+	db := client.Database(cfg.Database)
+	entries := db.Collection(cfg.Collection)
+	chainColl := db.Collection(cfg.Collection + "_chain_state")
+
+	if err := probeTransactionSupport(ctx, client, chainColl); err != nil {
 		_ = client.Disconnect(ctx)
 		appLogger.Errorf("graudit/mongo: transaction probe failed: %v", err)
 		return nil, fmt.Errorf("graudit/mongo: %w", graudit.ErrReplicaSetRequired)
 	}
-
-	db := client.Database(cfg.Database)
-	entries := db.Collection(cfg.Collection)
-	chainColl := db.Collection(cfg.Collection + "_chain_state")
 
 	if err := ensureIndexes(ctx, entries); err != nil {
 		_ = client.Disconnect(ctx)
@@ -182,11 +182,23 @@ func NewMongoAuditLog(cfg MongoConfig) (graudit.AuditLog, error) {
 	return &AuditLog{client: client, entries: entries, chainColl: chainColl, logger: appLogger, bus: cfg.EventBus}, nil
 }
 
-// probeTransactionSupport runs a no-op multi-document transaction to
-// confirm the deployment supports them — this is documented driver
-// behavior for detecting a standalone (non-replica-set) instance, which
-// rejects StartTransaction with a clear server-side error.
-func probeTransactionSupport(ctx context.Context, client *mongo.Client) error {
+// probeProbeDocID is a reserved chain-state document ID used only by
+// probeTransactionSupport, distinct from chainStateID ("tail") so it can
+// never collide with the real tail document.
+const probeDocID = "__graudit_transaction_probe__"
+
+// probeTransactionSupport confirms the deployment supports multi-document
+// transactions by performing a real write-then-delete inside a
+// transaction, not a true no-op. This is load-bearing, not cosmetic: a
+// no-op transaction body never sends an actual transaction-start command
+// to the server, so it silently "succeeds" even against a standalone
+// (non-replica-set) deployment — confirmed empirically: MongoDB only
+// rejects transactions with "Transaction numbers are only allowed on a
+// replica set member or mongos" once a real operation is attempted inside
+// one, not on session.StartTransaction/CommitTransaction alone. The probe
+// document is inserted and deleted within the same transaction, so
+// nothing persists in chainColl either way.
+func probeTransactionSupport(ctx context.Context, client *mongo.Client, chainColl *mongo.Collection) error {
 	session, err := client.StartSession()
 	if err != nil {
 		return err
@@ -194,6 +206,12 @@ func probeTransactionSupport(ctx context.Context, client *mongo.Client) error {
 	defer session.EndSession(ctx)
 
 	_, err = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+		if _, err := chainColl.InsertOne(sc, bson.M{"_id": probeDocID}); err != nil {
+			return nil, err
+		}
+		if _, err := chainColl.DeleteOne(sc, bson.M{"_id": probeDocID}); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	})
 	return err
