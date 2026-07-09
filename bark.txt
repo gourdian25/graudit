@@ -1,3 +1,28 @@
 .
+├── CLAUDE.md
+├── audit.go
+├── audit_test.go
+├── conformance/
+│   └── conformance.go
+├── diff.go
+├── diff_test.go
+├── docs/
+│   └── plan/
+│       └── graudit-plan.md
+├── docs.go
+├── errors.go
+├── events.go
+├── events_test.go
+├── go.mod
+├── go.sum
+├── hash.go
+├── hash_test.go
+├── logger.go
+├── memory/
+│   ├── memory.go
+│   └── memory_test.go
+└── postgres/
+    ├── postgres.go
+    └── postgres_test.go
 
-0 directories, 0 files
+5 directories, 20 files

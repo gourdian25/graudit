@@ -9,6 +9,21 @@
 
 ## 0. Read this before anything else: assess whether to build this at all
 
+> **Resolved 2026-07-09**: The build-vs-defer question below was answered
+> during pre-implementation research: `gourdianerp` does not exist yet, and
+> `grauth`/`grpolicy` are empty directories, exactly the "no real need yet"
+> scenario this section warns about. Despite that, the user explicitly
+> decided to build graudit now, and expanded its scope beyond what's
+> described below: **three storage backends ship in v1** (`graudit/memory`,
+> `graudit/postgres`, `graudit/mongo` — not just Postgres+memory), full
+> release-tooling parity with sibling repos (goreleaser, golangci-lint,
+> CHANGELOG, SECURITY.md), and >80% test coverage enforced per-package. This
+> is a locked-in decision, not an open question — the rest of this document
+> is retained as historical context for the reasoning that preceded it,
+> matching how grcache's and grevents' own CLAUDE.md files treat their plan
+> docs once real code exists. See `docs/architecture.md` (once written) and
+> the implementation plan for the resolved design.
+
 Unlike grcache and grevents, graudit was flagged from the start as a strong
 **"Defer" candidate**. Hash-chaining and tamper detection are genuinely hard
 to get right — this is architecturally closer to a minimal blockchain data
@@ -44,8 +59,12 @@ assessment before doing anything else.
    publish an event via grevents after successfully writing an audit entry,
    so other consumers (a future notification system, a dashboard) can react
    without graudit knowing they exist. Confirm the exact `Bus.Publish`
-   signature and decide what topic name(s) graudit will publish
-   (e.g. `"audit.entry.recorded"`).
+   signature and decide what topic name(s) graudit will publish.
+   **Resolved**: real grevents examples (`role.assigned`, `order.placed`,
+   `payment.failed`, `user.signup`) confirm the topic convention is
+   **two segments**, `resource.pastTenseVerb` — graudit publishes
+   `"audit.recorded"` (not the three-segment `"audit.entry.recorded"`
+   originally sketched here).
 2. **Read `~/Dev/gourdian25/grcache` in full**, focusing on:
    - Its multi-backend subpackage structure (`grcache/redis`,
      `grcache/postgres`, etc.) — graudit's own storage backend decision
@@ -93,13 +112,12 @@ contribute to SOC2/HIPAA/PCI readiness, not the whole solution.
   is computed over (entry payload + previous entry's hash), so altering or
   deleting any historical entry breaks the chain from that point forward in
   a way `Verify()` can detect.
-- **One durable backend for v1: PostgreSQL.** Not five backends like
-  grcache — an audit trail's entire value proposition depends on durability
-  and queryability by indexed fields (actor, entity, time range), which
-  points at a relational store as the sensible default, not in-memory. An
-  **in-memory backend also ships**, but explicitly for testing/dev use only
-  (same framing as grcache's Postgres/Mongo backends being test/dev-labeled)
-  — never recommended for anything you actually need to keep.
+- **Three backends ship in v1**: `graudit/memory` (test/dev only, never for
+  anything you need to keep), `graudit/postgres`, and `graudit/mongo` (both
+  production-eligible, durable) — following grcache's subpackage-per-backend
+  layout, so a consumer using only one backend doesn't pull in the other's
+  driver. (Originally scoped as Postgres-only + memory; expanded to include
+  Mongo per explicit user decision — see §0.)
 - **`Verify(from, to)`**: recomputes the hash chain across the given entry
   range and confirms every entry's stored hash matches what recomputing it
   from its payload + the previous entry's hash would produce. Returns
@@ -131,9 +149,6 @@ contribute to SOC2/HIPAA/PCI readiness, not the whole solution.
   automatic interception (e.g. via middleware that wraps every grauth
   mutation) is a reasonable future idea but adds real complexity and
   coupling — deliberately deferred.
-- **Multiple simultaneous storage backends beyond Postgres + in-memory.**
-  No Mongo, no Redis-backed audit storage in v1 — an audit trail in a cache
-  that can evict entries is a contradiction in terms.
 - **Cryptographic non-repudiation (digital signatures per entry).** Hash-
   chaining proves internal consistency (nothing was altered/removed without
   detection) but does NOT prove *who* wrote a given entry beyond whatever
@@ -180,6 +195,14 @@ type AuditLog interface {
 	Close() error
 }
 
+// GenesisPrevHash is the well-known PrevHash value for the first entry in a
+// chain (64 zero characters, matching SHA-256's hex output length). Exported
+// so every backend and Verify() agree on one value instead of each
+// hardcoding its own — computed via strings.Repeat rather than a hand-typed
+// literal, since a miscounted zero would be exactly the kind of subtle
+// determinism bug this package exists to prevent.
+var GenesisPrevHash = strings.Repeat("0", 64)
+
 type EntryID uint64 // strictly increasing, chain position — not a UUID
 
 type AuditEvent struct {
@@ -210,6 +233,38 @@ type VerifyResult struct {
 }
 ```
 
+### 4.1a grevents injection (resolved)
+
+`grevents.Bus` is **not** part of the `AuditLog` interface. It is a
+construction-time dependency injected via each backend's `Config`/`Option`
+(`EventBus grevents.Bus`, or `WithEventBus(bus)` for the memory backend),
+exactly like the optional `Logger` — defaulting to `nil`, meaning no publish,
+not an error. This is implemented once, in `events.go`:
+
+```go
+const TopicAuditRecorded = "audit.recorded"
+
+func PublishRecorded(ctx context.Context, bus grevents.Bus, logger Logger, entry AuditEvent) {
+	if bus == nil {
+		return
+	}
+	if err := bus.Publish(ctx, grevents.Event{
+		Topic:   TopicAuditRecorded,
+		Payload: entry,
+		Metadata: map[string]string{
+			"actor_id": entry.ActorID, "entity_type": entry.EntityType, "entity_id": entry.EntityID,
+		},
+	}); err != nil {
+		logger.Warnf("graudit: publish %s for entry %d failed: %v", TopicAuditRecorded, entry.ID, err)
+	}
+}
+```
+
+Every backend calls `PublishRecorded` once after its own durable write
+commits. A publish failure is logged, never returned as a `Record()` error —
+the durable write is the source of truth, grevents is a best-effort side
+channel.
+
 ### 4.2 The hard problem: single-writer serialization
 
 Because each entry's hash depends on the *immediately preceding* entry's
@@ -221,32 +276,37 @@ worst case, without a DB-level guard: two entries silently claim the same
 chain position).
 
 This is the single hardest and most safety-critical design problem in this
-repo. Candidate approaches for the agent to evaluate against the actual
-Postgres backend:
+repo. **Resolved design, per backend:**
 
-- **Database-level serialization**: an `EntryID` column that's a Postgres
-  `SERIAL`/`BIGSERIAL` combined with a `SELECT ... FOR UPDATE` on the
-  "latest entry" row (or an advisory lock, `pg_advisory_xact_lock`) inside
-  the same transaction that inserts the new entry — guarantees correctness
-  at the DB layer regardless of how many app-process goroutines call
-  `Record()` concurrently, and correctly serializes even across multiple
-  app instances (unlike an in-process mutex, which only protects a single
-  process).
-- **Application-level single-writer goroutine**: all `Record()` calls
-  funnel through one channel to a single dedicated writer goroutine. Simple
-  and correct *within one process*, but does NOT protect against a second
-  process (a second `gourdianerp` replica) writing to the same Postgres
-  table concurrently — this only works if you can guarantee graudit is a
-  process-wide singleton talking to a database no other process writes to
-  directly, which is a fragile assumption to build a "tamper-evident" system
-  on.
-
-**Recommendation for the agent to validate:** the DB-level advisory-lock or
-`SELECT FOR UPDATE` approach is very likely the right one for the Postgres
-backend, specifically *because* it's the only approach that remains correct
-if `gourdianerp` ever runs more than one replica. The in-memory backend
-(test/dev only, single-process by definition) can safely use a plain
-`sync.Mutex`.
+- **`graudit/postgres`**: `pg_advisory_xact_lock(chainLockKey)` (a single
+  constant key — one global chain in v1, no per-tenant sub-chains) taken
+  inside the same transaction that reads the current tail and inserts the
+  new entry; released automatically on commit/rollback. `EntryID` is
+  **explicitly assigned by application code inside the locked transaction,
+  not a `SERIAL`/`BIGSERIAL` column** — a Postgres sequence advances even
+  when its transaction rolls back, which would silently create a gap in
+  `EntryID` with no corresponding entry, breaking the "strictly increasing,
+  no gaps" contract and making a legitimate rollback-gap indistinguishable
+  from tampering. Chosen over `SELECT ... FOR UPDATE` on the latest row
+  because that requires a row to lock, which doesn't exist for the
+  empty-chain (genesis) case without adding a separate sentinel row — the
+  advisory lock handles genesis and non-genesis uniformly. Remains correct
+  across multiple app replicas talking to the same Postgres instance.
+- **`graudit/mongo`**: a singleton tail document (`{_id: "tail",
+  lastEntryId, lastHash}`) updated inside a multi-document ACID transaction
+  (`session.WithTransaction`) alongside the new entry's insert. **Requires
+  the target deployment to be a replica set unconditionally** — there is no
+  `useTransactions bool` escape hatch (unlike gourdiantoken's Mongo repo),
+  because graudit's correctness, not just performance, depends on the
+  transaction. `NewMongoAuditLog` fails fast at construction (a probe
+  transaction) against a standalone instance rather than silently
+  degrading to non-transactional writes that could corrupt the chain.
+  `session.WithTransaction` already retries internally on
+  `TransientTransactionError`/`UnknownTransactionCommitResult` — no
+  additional manual retry loop is needed or should be added.
+- **`graudit/memory`**: a single `sync.Mutex` guarding the in-memory tail
+  state and entry slice together — sufficient because this backend is
+  single-process, test/dev-only by definition.
 
 ### 4.3 Hash computation
 
@@ -255,19 +315,26 @@ hash = SHA256(entryID || actorID || entityType || entityID || action ||
               canonicalJSON(payload) || timestamp || prevHash)
 ```
 
-Use a canonical JSON encoding (sorted keys, no ambiguous whitespace — Go's
-`encoding/json` on a `map[string]any` does not guarantee key order across
-runs by default, so confirm the actual serialization approach produces a
-stable byte sequence for the same logical payload every time, or hashing
-will be non-deterministic and `Verify()` will falsely report tampering).
-This determinism check is worth its own explicit test.
+**Resolved canonical encoding**: round-trip `payload` through `json.Marshal`
+→ `json.Decoder` with `UseNumber()` into `map[string]any`/`[]any`/scalars
+(`UseNumber()` avoids the float64-reformatting-large-integers trap that
+plain `json.Unmarshal` into `any` would introduce), then recursively
+re-encode with object keys sorted, no whitespace, arrays keeping order, and
+leaf strings encoded via `json.Marshal` to reuse Go's correct escaping — a
+custom recursive encoder, not a third-party canonical-JSON library (none
+exists elsewhere in the ecosystem, and the payload shape is fully within
+graudit's control). `timestamp` is fixed to `time.RFC3339Nano` in UTC (not
+default `Time.String()`, which is timezone/precision-dependent). This
+determinism claim is covered by an explicit `hash_test.go` test: two
+`AuditEvent`s with logically identical payloads but different map key
+insertion order must hash identically.
 
 ### 4.4 Genesis entry
 
-The very first entry in a chain has `PrevHash = ""` (or a well-known
-constant, e.g. 64 zero characters) — document this explicitly so `Verify()`
-knows how to treat entry #1 as a special case rather than looking for a
-non-existent "entry #0."
+The very first entry in a chain has `PrevHash = graudit.GenesisPrevHash`
+(64 zero characters, matching SHA-256's hex output length) — document this
+explicitly so `Verify()` knows how to treat entry #1 as a special case
+rather than looking for a non-existent "entry #0."
 
 ---
 
@@ -275,40 +342,62 @@ non-existent "entry #0."
 
 ```
 graudit/
-├── audit.go              // AuditLog interface, AuditEvent, EntryID, QueryFilter, VerifyResult
-├── hash.go                 // hash computation + canonical JSON encoding, isolated for independent testing
+├── audit.go              // AuditLog interface, AuditEvent, EntryID, QueryFilter, VerifyResult, GenesisPrevHash
+├── hash.go                 // ComputeHash (exported for subpackage use) + canonical JSON encoding, isolated for independent testing
 ├── diff.go                   // snapshot diff engine used by RecordChange
 ├── errors.go
+├── logger.go                    // optional structural Logger interface, NopLogger/OrNop
+├── events.go                       // grevents integration: TopicAuditRecorded, PublishRecorded
+├── docs.go                           // package godoc only
 ├── postgres/
-│   └── postgres.go              // primary durable backend; owns the serialization strategy from §4.2
+│   └── postgres.go                     // pg_advisory_xact_lock serialization; explicit (non-serial) EntryID
 ├── memory/
-│   └── memory.go                  // test/dev-only backend; sync.Mutex-serialized
-├── events.go                         // grevents integration: what gets published, topic naming
+│   └── memory.go                         // test/dev-only backend; sync.Mutex-serialized
+├── mongo/
+│   └── mongo.go                            // session.WithTransaction serialization; entries + chain_state collections; replica set required
+├── example/
+│   └── example.go                            // runnable demo against the memory backend
 └── conformance/
-    └── conformance.go                  // shared behavioral suite: hash-chain integrity, tamper detection, concurrent Record() ordering, Verify() correctness on a deliberately-corrupted chain
+    └── conformance.go                          // shared behavioral suite: hash-chain integrity, tamper detection, concurrent Record() ordering, Verify() correctness on a deliberately-corrupted chain, grevents publish/publish-failure
 ```
 
 ---
 
 ## 6. Testing strategy (this repo needs more adversarial testing than any prior repo)
 
+Every test below is implemented **once**, in `conformance/conformance.go`,
+and parameterized across all three backends via each backend's own
+`TestConformance(t *testing.T)` — not hand-duplicated per backend.
+
 - **Concurrent `Record()` stress test**: fire N concurrent `Record()` calls
   at the same chain and confirm afterward that (a) every entry got a unique,
   strictly sequential `EntryID`, and (b) `Verify()` over the whole chain
   passes. This is the most important test in the whole repo — it directly
-  validates §4.2's serialization strategy actually works, not just that it
+  validates §4.2's serialization strategy actually works (mutex / advisory
+  lock / Mongo transaction, depending on backend), not just that it
   compiles.
 - **Deliberate tamper test**: write N entries, then directly mutate one
-  entry's payload in the underlying Postgres table (bypassing graudit's own
-  API, simulating an attacker or a bug elsewhere touching the table
-  directly), then call `Verify()` and confirm it correctly reports
-  `Valid: false` with the right `BrokenAt` entry ID.
+  entry's payload in the underlying storage (bypassing graudit's own API via
+  a per-backend `WithTamperHook`: raw SQL for postgres, raw driver call for
+  mongo, direct struct mutation for memory), then call `Verify()` and
+  confirm it correctly reports `Valid: false` with the right `BrokenAt`
+  entry ID.
 - **Hash determinism test**: construct two `AuditEvent`s with logically
   identical payloads but different in-memory map key insertion order, and
   confirm they hash identically (validates the canonical-encoding claim in
-  §4.3).
+  §4.3) — a pure unit test in root `hash_test.go`, plus re-asserted
+  end-to-end through `Record` in conformance to catch a backend
+  accidentally re-serializing the payload differently before hashing.
 - **Genesis entry test**: confirm `Verify()` handles a chain of length 1
   correctly (no prior entry to compare against).
+- **`grevents` publish test**: a stub `Bus` test double records `Publish`
+  calls; confirm exactly one call per successful `Record`, with topic
+  `graudit.TopicAuditRecorded` and the recorded `AuditEvent` as payload.
+- **`grevents` publish-failure test**: a stub bus whose `Publish` always
+  errors; confirm `Record` still succeeds and the entry is durably
+  queryable — validates the ordering guarantee in §4.1a.
+- **`RecordChange` diff test**: confirm the diff engine produces the
+  expected `ChangeDiff` payload for a representative before/after pair.
 - Race detector mandatory, same as every prior repo.
 
 ---
@@ -324,6 +413,9 @@ graudit/
   not required for correctness.
 - PostgreSQL driver (GORM, matching grcache's existing Postgres backend
   conventions, for ecosystem consistency).
+- MongoDB driver (`go.mongodb.org/mongo-driver` **v1**, not the breaking
+  `/v2` rewrite — matching grcache/mongo's own justification for staying on
+  v1).
 
 ---
 
@@ -340,24 +432,33 @@ graudit/
 
 ---
 
-## 9. Evaluation questions for the agent
+## 9. Evaluation questions for the agent (resolved — answers below, see the implementation plan for full detail)
 
-1. **Restate the §0 assessment explicitly**: build now, or defer? Justify
-   with whatever was actually found about `gourdianerp`'s current state.
-2. If proceeding: which serialization strategy from §4.2 does the agent
-   recommend, and why — specifically addressing the multi-replica
-   correctness concern, not just single-process correctness?
-3. Does the canonical JSON encoding approach in §4.3 actually produce
-   deterministic output for logically-equivalent Go values (maps, nested
-   structs) — what specific encoding function/library call was chosen, and
-   how was determinism verified?
-4. What exact grevents topic name(s) will `Record()` publish, and does this
-   conflict with or duplicate anything already established as convention in
-   `grevents`' own docs/examples?
-5. Does `Verify()`'s claim of detecting tampering hold up against the
-   deliberate-tamper test in §6 — show the actual test and its result before
-   claiming this works.
-6. Given everything read from grcache and grevents, is there anything in
-   graudit's planned API (§4.1) that's inconsistent with sibling
-   conventions (naming, error style, Close() pattern) that should be
-   fixed before implementation starts?
+1. **§0 assessment**: `gourdianerp` does not exist; `grauth`/`grpolicy` are
+   empty. The honest answer was "no real need yet" — the user was informed
+   of this and explicitly chose to build anyway with expanded scope. See §0.
+2. **Serialization strategy**: resolved per-backend in §4.2 —
+   `pg_advisory_xact_lock` + explicit `EntryID` (postgres),
+   `session.WithTransaction` + mandatory replica set (mongo), `sync.Mutex`
+   (memory). All three address multi-writer correctness at the layer
+   appropriate to that backend (DB-level for postgres/mongo, since those are
+   the multi-replica-safe backends; process-level for memory, since it's
+   explicitly single-process by design).
+3. **Canonical JSON**: resolved in §4.3 — `json.Decoder.UseNumber()` round
+   trip + custom recursive sorted-key encoder, `time.RFC3339Nano` UTC
+   timestamps, verified by an explicit `hash_test.go` determinism test.
+4. **grevents topic**: resolved — `"audit.recorded"`, matching the confirmed
+   real two-segment convention (§1, §4.1a).
+5. **Verify() tamper detection**: resolved design uses two checks per entry
+   (per-entry stored-hash recomputation + adjacent stored-`PrevHash`
+   linkage) so `BrokenAt` correctly pinpoints the first broken link rather
+   than cascading every subsequent entry as broken — see the implementation
+   plan for the full reasoning. The conformance suite's
+   `VerifyDetectsTamper` scenario is the test that proves this, run against
+   all three backends.
+6. **API consistency with siblings**: `Close()` stays on `AuditLog` (every
+   sibling top-level interface includes it); sentinel errors follow the
+   universal `errors.New`/no-`IsX()`-helper convention; `Logger` is the same
+   structural optional interface as grcache's; `grevents.Bus` is injected
+   via Config/Option, not the interface, keeping `AuditLog` itself free of a
+   grevents import.

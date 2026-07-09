@@ -1,0 +1,35 @@
+version: "2"
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - gosec
+    - misspell
+    - gocritic
+    - revive
+  settings:
+    revive:
+      rules:
+        # AuditLog, Logger, and grevents.Bus are fixed interface shapes —
+        # test doubles (conformance's stubBus) and backend constructors
+        # legitimately don't need every parameter, and dropping the name
+        # would make call sites harder to read against the interface
+        # they're implementing.
+        - name: unused-parameter
+          disabled: true
+  exclusions:
+    rules:
+      # Test files use test-controlled inputs by design (conformance's
+      # concurrent-stress scenario, tamper hooks deliberately bypassing the
+      # API).
+      - path: _test\.go
+        linters: [gosec, errcheck, gocritic]
+      - path: conformance/conformance\.go
+        linters: [gosec, errcheck, gocritic]
+      - path: example/example\.go
+        linters: [gosec, errcheck, gocritic]
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
