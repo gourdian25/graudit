@@ -30,9 +30,9 @@
 ├── memory/
 │   ├── memory.go
 │   └── memory_test.go
-├── mongo/
-│   ├── mongo.go
-│   └── mongo_test.go
+├── mongostore/
+│   ├── mongostore.go
+│   └── mongostore_test.go
 └── postgres/
     ├── postgres.go
     └── postgres_test.go
