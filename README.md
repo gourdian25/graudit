@@ -8,6 +8,24 @@ hasn't been altered" — a different question from what
 this request"). It is a library component that could contribute to
 SOC2/HIPAA/PCI readiness, not a compliance certification product itself.
 
+## Part of the gourdian25 ecosystem
+
+graudit is one of several small, independent Go libraries meant to be used
+together:
+
+- [gourdiantoken](https://github.com/gourdian25/gourdiantoken) — JWT
+  access/refresh token issuance, verification, revocation, and rotation.
+- [grlog](https://github.com/gourdian25/grlog) — zero-dependency structured
+  logging; graudit's optional `Logger` interface is satisfied by it directly.
+- [grcache](https://github.com/gourdian25/grcache) — backend-agnostic
+  caching abstraction, mirroring graudit's own subpackage-per-backend layout.
+- [grevents](https://github.com/gourdian25/grevents) — an in-process event
+  bus; graudit publishes an `"audit.recorded"` event through it on every
+  successful write (see below).
+- [grpolicy](https://github.com/gourdian25/grpolicy) — attribute-based
+  policy evaluation (RBAC/ABAC), independent of any notion of "user" or
+  "role".
+
 ## The precise claim (read this before trusting `Verify()`)
 
 Hash-chaining proves **internal consistency**: nothing in the recorded
@@ -69,7 +87,7 @@ need one backend don't pull in the others' client libraries.
 |---|---|---|---|
 | In-memory | `graudit/memory` | Test/dev only — never for anything you need to keep | `sync.Mutex` |
 | PostgreSQL | `graudit/postgres` | Production | `pg_advisory_xact_lock` + explicitly-assigned `EntryID` |
-| MongoDB | `graudit/mongo` | Production (requires a replica set) | Multi-document ACID transaction |
+| MongoDB | `graudit/mongostore` | Production (requires a replica set) | Multi-document ACID transaction |
 
 ```go
 // Postgres
@@ -80,8 +98,8 @@ auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
 
 // MongoDB — must be a replica set (single-node is sufficient); construction
 // fails fast otherwise, wrapping graudit.ErrReplicaSetRequired.
-import "github.com/gourdian25/graudit/mongo"
-auditLog, err := mongo.NewMongoAuditLog(mongo.MongoConfig{
+import "github.com/gourdian25/graudit/mongostore"
+auditLog, err := mongostore.NewMongoAuditLog(mongostore.MongoConfig{
 	URI:      "mongodb://localhost:27017/?replicaSet=rs0",
 	Database: "myapp",
 })

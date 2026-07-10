@@ -88,8 +88,8 @@ func main() {
 	//		DSN: "host=localhost user=myuser password=mypass dbname=mydb port=5432 sslmode=disable",
 	//	})
 	//
-	//	import "github.com/gourdian25/graudit/mongo"
-	//	auditLog, err := mongo.NewMongoAuditLog(mongo.MongoConfig{
+	//	import "github.com/gourdian25/graudit/mongostore"
+	//	auditLog, err := mongostore.NewMongoAuditLog(mongostore.MongoConfig{
 	//		URI:      "mongodb://localhost:27017/?replicaSet=rs0",
 	//		Database: "myapp",
 	//	})

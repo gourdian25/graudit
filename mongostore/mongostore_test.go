@@ -1,6 +1,6 @@
-// File: mongo/mongo_test.go
+// File: mongostore/mongostore_test.go
 
-package mongo_test
+package mongostore_test
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 
 	"github.com/gourdian25/graudit"
 	"github.com/gourdian25/graudit/conformance"
-	graudmongo "github.com/gourdian25/graudit/mongo"
+	graudmongo "github.com/gourdian25/graudit/mongostore"
 	"github.com/gourdian25/grevents"
 )
 
