@@ -170,29 +170,23 @@ one recomputed from its own stored fields, and that each entry's stored
 ## Testing
 
 graudit's own tests run against real local Postgres/MongoDB instances — no
-mocks — mirroring the ecosystem's testing philosophy.
+mocks — mirroring the ecosystem's testing philosophy. These are the same
+shared containers grnoti, grcache, and gourdiantoken test against (each
+repo gets its own database) — start them with:
 
 ```sh
-docker run -d --name graudit-postgres -p 5432:5432 \
-  -e POSTGRES_USER=postgres_user -e POSTGRES_PASSWORD=postgres_password postgres:16
-createdb -U postgres_user -h localhost graudit_test
-
-# No auth env vars: MONGO_INITDB_ROOT_USERNAME/PASSWORD enables auth, which
-# requires a keyFile once --replSet is also set ("security.keyFile is
-# required when authorization is enabled with replica sets") — unnecessary
-# complexity for a local test replica set, so this container runs without
-# auth.
-docker run -d --name graudit-mongo -p 27018:27017 mongo:7 --replSet rs0
-docker exec graudit-mongo mongosh --eval 'rs.initiate()'
-
-# A second, genuinely standalone (no --replSet) instance, required by
-# TestNewMongoAuditLog_RequiresReplicaSet — the one test that actually
-# proves construction fails fast against a non-replica-set deployment
-# (see mongo/mongo_test.go's comment for why this test must never be
-# skipped: an earlier version of this exact test caught a real bug where
-# the fail-fast check silently passed against a standalone instance).
-docker run -d --name graudit-mongo-standalone -p 27019:27017 mongo:7
+make docker-up   # starts the shared Postgres/Mongo(auth)/Mongo(standalone) test containers
+make docker-down # stops them when you're done
 ```
+
+The primary Mongo container is an authenticated single-node replica set —
+the workspace-wide standard. A second, genuinely standalone (no `--replSet`,
+no auth) instance is also started, required by
+`TestNewMongoAuditLog_RequiresReplicaSet` — the one test that actually
+proves construction fails fast against a non-replica-set deployment (see
+`mongostore/mongostore_test.go`'s comment for why this test must never be
+skipped: an earlier version of this exact test caught a real bug where the
+fail-fast check silently passed against a standalone instance).
 
 The Mongo backend additionally requires the instance to be configured as a
 replica set (single-node is sufficient) — construction fails fast against

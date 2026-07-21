@@ -43,29 +43,42 @@ Run a single test: `go test -run TestConformance/ConcurrentRecordStress ./postgr
 
 ### Backend tests require live local services
 
-`postgres` and `mongo` need a real running service — no mocks, mirroring
+`postgres` and `mongostore` need a real running service — no mocks, mirroring
 every sibling repo's testing philosophy. `memory` needs nothing.
 
+These are **shared across the whole gourdian25 workspace** (grnoti, graudit,
+grcache, gourdiantoken all test against the same running Postgres/Mongo
+instances, each using its own database), with one deliberate exception: the
+second, standalone Mongo container below exists only for this repo's own
+replica-set-required regression test.
+
 ```sh
-docker run -d --name graudit-postgres -p 5432:5432 \
+docker run -d --name gourdian-postgres -p 5432:5432 \
   -e POSTGRES_USER=postgres_user -e POSTGRES_PASSWORD=postgres_password postgres:16
 createdb -U postgres_user -h localhost graudit_test
 
-# No auth env vars — MONGO_INITDB_ROOT_USERNAME/PASSWORD enables auth,
-# which requires a keyFile once --replSet is also set. Unnecessary for a
-# local test replica set.
-docker run -d --name graudit-mongo -p 27018:27017 mongo:7 --replSet rs0
-docker exec graudit-mongo mongosh --eval 'rs.initiate()'
+# Auth + --replSet requires a --keyFile (MongoDB enforces this even for a
+# single-node set) — generate one once, in a named volume so file
+# permissions/ownership survive correctly across container recreation:
+docker volume create gourdian-mongo-keyfile
+docker run --rm -v gourdian-mongo-keyfile:/keyfile-dir mongo:7 bash -c \
+  "openssl rand -base64 756 > /keyfile-dir/mongo-keyfile && chmod 400 /keyfile-dir/mongo-keyfile && chown 999:999 /keyfile-dir/mongo-keyfile"
+docker run -d --name gourdian-mongo-auth -p 27018:27017 \
+  -e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=mongo_password \
+  -v gourdian-mongo-keyfile:/etc/mongo-keyfile-dir \
+  mongo:7 --replSet rs0 --keyFile /etc/mongo-keyfile-dir/mongo-keyfile
+docker exec gourdian-mongo-auth mongosh -u root -p mongo_password \
+  --authenticationDatabase admin --eval 'rs.initiate()'
 
-# A second, genuinely standalone (no --replSet) instance is also required —
-# TestNewMongoAuditLog_RequiresReplicaSet in mongo/mongo_test.go needs it,
-# and must never be skipped/reverted to skipping: a pre-v0.1.0 audit found
+# A second, genuinely standalone (no --replSet, no auth) instance is also
+# required — TestNewMongoAuditLog_RequiresReplicaSet in mongostore/mongostore_test.go
+# needs it, and must never be skipped/reverted to skipping: a pre-v0.1.0 audit found
 # that probeTransactionSupport's original no-op transaction body never sent
 # a real transaction-start command to the server, so it silently reported
 # "transactions supported" even against a standalone deployment — this
 # test is the only thing that catches that class of bug. Fixed by making
 # the probe perform a real (self-cleaning) write inside the transaction.
-docker run -d --name graudit-mongo-standalone -p 27019:27017 mongo:7
+docker run -d --name gourdian-mongo-standalone -p 27019:27017 mongo:7
 ```
 
 The Mongo backend **requires** the instance to be a replica set (single-node
@@ -74,6 +87,12 @@ is sufficient) — `NewMongoAuditLog` fails fast, wrapping
 requirement (correctness, not just consistency-under-load — see
 `docs/architecture.md`), unlike gourdiantoken's optional `useTransactions
 bool` escape hatch.
+
+**Note:** the primary (non-standalone) Mongo container above now requires
+auth, matching the shared workspace standard — `mongostore.go`'s connection
+config doesn't wire up credentials yet; adding that support is tracked as
+pending work, alongside the `postgres/` → root-package flattening and
+GORM → pgx+sqlc migration.
 
 ## Architecture
 
