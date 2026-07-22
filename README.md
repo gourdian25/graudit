@@ -104,6 +104,15 @@ auditLog, err := graudit.NewMongoAuditLog(graudit.MongoConfig{
 })
 ```
 
+### Why this shape
+
+graudit used to split Postgres/Mongo/memory into separate importable
+subpackages and used GORM for its Postgres backend. Both changed as part
+of an ecosystem-wide standardization pass: the backends flattened into
+this one root package, and GORM was replaced with `pgx/v5` +
+sqlc-generated queries. See [CHANGELOG.md](CHANGELOG.md)'s `[Unreleased]`
+entry for the full rationale.
+
 ## grevents integration
 
 Every backend accepts an optional [`grevents.Bus`](https://github.com/gourdian25/grevents)
@@ -178,6 +187,9 @@ make docker-up   # starts the shared Postgres/Mongo(auth)/Mongo(standalone) test
 make docker-down # stops them when you're done
 ```
 
+The root package maintains 95.2% test coverage, enforced by a 95% gate
+(`make coverage-check`).
+
 The primary Mongo container is an authenticated single-node replica set —
 the workspace-wide standard. A second, genuinely standalone (no `--replSet`,
 no auth) instance is also started, required by
@@ -218,6 +230,23 @@ sweeping of old entries. See
 [docs/plan/graudit-plan.md](docs/plan/graudit-plan.md) for the full
 roadmap.
 
+## Contributing
+
+```sh
+make fmt              # gofmt
+make vet              # go vet
+make lint              # golangci-lint (if installed)
+make test               # go test -cover ./...
+make race                # go test -race ./...  — mandatory before any PR touching the hash-chain or serialization code
+make coverage-check        # the root package must meet 95%
+```
+
+See [CLAUDE.md](CLAUDE.md) for the full architecture rundown.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+See [CHANGELOG.md](CHANGELOG.md) for release history and
+[SECURITY.md](SECURITY.md) to report a vulnerability privately instead of
+opening a public issue.

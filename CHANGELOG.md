@@ -100,6 +100,20 @@ Contains **breaking changes** (allowed pre-1.0).
   undecodable stored payload on that backend (see the comment in
   `postgres_test.go`).
 
+### Documentation
+
+- README: added a Contributing section (previously went straight from
+  "Out of scope" to "License"), pointing at the same `fmt`/`vet`/`lint`/
+  `test`/`race`/`coverage-check` Makefile targets grcache's own
+  Contributing section documents.
+- README: stated the precise root-package coverage number (95.2%, via
+  `make coverage-check`) near Testing, previously unstated.
+- README: linked `SECURITY.md` and `CHANGELOG.md` from the closing section
+  (neither was previously linked).
+- README: added a short "Why this shape" note near Backends explaining the
+  flattened-package, GORM-removed history, pointing at this entry for the
+  full rationale rather than duplicating it.
+
 ## [0.2.0] - 2026-07-10
 
 Ecosystem-alignment pass ahead of `grauth`. Contains a **breaking change**
