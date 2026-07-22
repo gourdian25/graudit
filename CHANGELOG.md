@@ -14,6 +14,16 @@ Contains **breaking changes** (allowed pre-1.0).
 
 ### Changed
 
+- **Breaking:** `Logger`'s three printf-style methods (`Infof`/`Warnf`/
+  `Errorf(format string, args ...interface{})`) replaced with four
+  `log/slog`-shaped methods (`Debug`/`Info`/`Warn`/`Error(msg string, args
+  ...any)`), matching `*slog.Logger`'s own signatures exactly so any
+  slog-based logger — including `*grlog.Logger` via
+  `slog.New(grlog.NewSlogHandler(...))` — satisfies it with no adapter.
+  Consistent with the same change landing across
+  grcache/grevents/grpolicy/grnoti/gourdiantoken in this pass. Real
+  structured field values (previously flattened into printf format
+  strings) now reach any structured-output logger intact.
 - **Breaking:** flattened from one root package plus a subpackage per
   backend (`graudit/memory`, `graudit/postgres`, `graudit/mongostore`)
   into a single flat package, matching every other repo in the gourdian

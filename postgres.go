@@ -141,13 +141,13 @@ func NewPostgresAuditLog(cfg PostgresConfig) (AuditLog, error) {
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		appLogger.Errorf("graudit: open failed: %v", err)
+		appLogger.Error("graudit: open failed", "error", err)
 		return nil, fmt.Errorf("graudit: open: %w", ErrBackendUnavailable)
 	}
 
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		appLogger.Errorf("graudit: ping failed: %v", err)
+		appLogger.Error("graudit: ping failed", "error", err)
 		return nil, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
 	}
 
@@ -156,7 +156,7 @@ func NewPostgresAuditLog(cfg PostgresConfig) (AuditLog, error) {
 		return nil, fmt.Errorf("graudit: apply schema: %w", err)
 	}
 
-	appLogger.Infof("graudit: connected")
+	appLogger.Info("graudit: connected")
 	return &postgresAuditLog{pool: pool, q: postgresdb.New(pool), logger: appLogger, bus: cfg.EventBus}, nil
 }
 
@@ -396,7 +396,7 @@ func (a *postgresAuditLog) Close() error {
 	a.closeOnce.Do(func() {
 		a.closed.Store(true)
 		a.pool.Close()
-		a.logger.Infof("graudit: audit log closed")
+		a.logger.Info("graudit: audit log closed")
 	})
 	return nil
 }

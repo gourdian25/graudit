@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 
 	"github.com/gourdian25/grevents"
 	"github.com/gourdian25/grlog"
@@ -19,15 +20,15 @@ import (
 )
 
 func main() {
-	// *grlog.Logger satisfies graudit.Logger with no adapter — see
-	// logger_test.go's TestGrlogSatisfiesLoggerInterface for the
-	// compile+run proof. Connection failures, grevents publish failures,
-	// and shutdown all get logged through it; a nil Logger (the default)
-	// means graudit logs nothing.
-	logger := grlog.NewDefaultLogger()
+	// slog.New(grlog.NewSlogHandler(...)) satisfies graudit.Logger with no
+	// adapter — see logger_test.go's TestGrlogSatisfiesLoggerInterface for
+	// the compile+run proof. Connection failures, grevents publish
+	// failures, and shutdown all get logged through it; a nil Logger (the
+	// default) means graudit logs nothing.
+	logger := slog.New(grlog.NewSlogHandler(grlog.NewDefaultLogger()))
 
 	// A bus closed before use, purely to make the logger visibly fire
-	// below: PublishRecorded logs (via Warnf) and swallows any publish
+	// below: PublishRecorded logs (via Warn) and swallows any publish
 	// error rather than failing Record — the durable write is graudit's
 	// guarantee, grevents delivery is a best-effort side channel on top of
 	// it. A real application would pass a live, running Bus here instead.

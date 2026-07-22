@@ -164,13 +164,13 @@ func NewMongoAuditLog(cfg MongoConfig) (AuditLog, error) {
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(cfg.URI))
 	if err != nil {
-		appLogger.Errorf("graudit: connect failed: %v", err)
+		appLogger.Error("graudit: connect failed", "error", err)
 		return nil, fmt.Errorf("graudit: connect: %w", ErrBackendUnavailable)
 	}
 
 	if err := client.Ping(ctx, readpref.Primary()); err != nil {
 		_ = client.Disconnect(ctx)
-		appLogger.Errorf("graudit: ping failed: %v", err)
+		appLogger.Error("graudit: ping failed", "error", err)
 		return nil, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
 	}
 
@@ -180,7 +180,7 @@ func NewMongoAuditLog(cfg MongoConfig) (AuditLog, error) {
 
 	if err := probeTransactionSupport(ctx, client, chainColl); err != nil {
 		_ = client.Disconnect(ctx)
-		appLogger.Errorf("graudit: transaction probe failed: %v", err)
+		appLogger.Error("graudit: transaction probe failed", "error", err)
 		return nil, fmt.Errorf("graudit: %w", ErrReplicaSetRequired)
 	}
 
@@ -189,7 +189,7 @@ func NewMongoAuditLog(cfg MongoConfig) (AuditLog, error) {
 		return nil, fmt.Errorf("graudit: ensure indexes: %w", err)
 	}
 
-	appLogger.Infof("graudit: connected to database %q collection %q", cfg.Database, cfg.Collection)
+	appLogger.Info("graudit: connected", "database", cfg.Database, "collection", cfg.Collection)
 	return &mongoAuditLog{client: client, entries: entries, chainColl: chainColl, logger: appLogger, bus: cfg.EventBus}, nil
 }
 
@@ -442,7 +442,7 @@ func (a *mongoAuditLog) Close() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		err = a.client.Disconnect(ctx)
-		a.logger.Infof("graudit: audit log closed")
+		a.logger.Info("graudit: audit log closed")
 	})
 	return err
 }

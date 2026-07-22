@@ -172,21 +172,28 @@ auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 
 ## Logger
 
-Every backend accepts an optional `graudit.Logger` (`Infof`/`Warnf`/`Errorf`)
-for diagnostic messages — connection failures, grevents publish failures,
-shutdown. A `nil` Logger (the default) means graudit logs nothing.
-[`*grlog.Logger`](https://github.com/gourdian25/grlog) satisfies this
-interface with no adapter, the same pattern grcache uses — see
-`logger_test.go`'s `TestGrlogSatisfiesLoggerInterface` for the compile+run
-proof, and [example/example.go](example/example.go) for a runnable demo.
+Every backend accepts an optional `graudit.Logger`
+(`Debug`/`Info`/`Warn`/`Error(msg string, args ...any)`, matching
+`*slog.Logger`'s own signatures) for diagnostic messages — connection
+failures, grevents publish failures, shutdown. A `nil` Logger (the default)
+means graudit logs nothing. Any slog-based logger, including one backed by
+grlog via [`slog.New(grlog.NewSlogHandler(...))`](https://github.com/gourdian25/grlog),
+satisfies this interface with no adapter, the same pattern grcache uses —
+see `logger_test.go`'s `TestGrlogSatisfiesLoggerInterface` for the
+compile+run proof, and [example/example.go](example/example.go) for a
+runnable demo.
 
 ```go
-import "github.com/gourdian25/grlog"
+import (
+	"log/slog"
 
-logger := grlog.NewDefaultLogger()
+	"github.com/gourdian25/grlog"
+)
+
+logger := slog.New(grlog.NewSlogHandler(grlog.NewDefaultLogger()))
 auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	DSN:    dsn,
-	Logger: logger, // *grlog.Logger satisfies graudit.Logger directly
+	Logger: logger, // *slog.Logger satisfies graudit.Logger directly
 })
 
 // memory takes MemoryOption functional options instead of a Config field:

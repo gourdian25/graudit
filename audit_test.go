@@ -51,9 +51,10 @@ func TestAuditEvent_Validate_NilPayloadOK(t *testing.T) {
 func TestLogger_NopAndOrNop(t *testing.T) {
 	nop := NopLogger()
 	// Must not panic.
-	nop.Infof("x")
-	nop.Warnf("x")
-	nop.Errorf("x")
+	nop.Debug("x")
+	nop.Info("x")
+	nop.Warn("x")
+	nop.Error("x")
 
 	if OrNop(nil) == nil {
 		t.Fatal("OrNop(nil) must never return nil")
@@ -69,9 +70,10 @@ type recordingLogger struct {
 	infos, warns, errs []string
 }
 
-func (l *recordingLogger) Infof(format string, args ...interface{})  { l.infos = append(l.infos, format) }
-func (l *recordingLogger) Warnf(format string, args ...interface{})  { l.warns = append(l.warns, format) }
-func (l *recordingLogger) Errorf(format string, args ...interface{}) { l.errs = append(l.errs, format) }
+func (l *recordingLogger) Debug(msg string, args ...any) { l.infos = append(l.infos, msg) }
+func (l *recordingLogger) Info(msg string, args ...any)  { l.infos = append(l.infos, msg) }
+func (l *recordingLogger) Warn(msg string, args ...any)  { l.warns = append(l.warns, msg) }
+func (l *recordingLogger) Error(msg string, args ...any) { l.errs = append(l.errs, msg) }
 
 func TestSentinelErrors_AreDistinct(t *testing.T) {
 	sentinels := []error{ErrClosed, ErrInvalidEvent, ErrEntryNotFound, ErrChainCorrupted, ErrBackendUnavailable, ErrReplicaSetRequired}
