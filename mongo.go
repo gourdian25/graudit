@@ -1,10 +1,11 @@
-// File: mongostore/mongostore.go
+// File: mongo.go
 
-// Package mongostore is graudit's second production-eligible durable backend. It
-// uses go.mongodb.org/mongo-driver v1 (the same driver family grcache/mongostore
-// and gourdiantoken depend on) — the v1 module is upstream-deprecated in
-// favor of go.mongodb.org/mongo-driver/v2, but migrating to that would be a
-// breaking API rewrite out of scope for a routine dependency choice.
+// MongoDB backend (mongoAuditLog) for graudit — production-eligible and
+// durable. Uses go.mongodb.org/mongo-driver v1 (the same driver family
+// grcache and gourdiantoken depend on) — the v1 module is
+// upstream-deprecated in favor of go.mongodb.org/mongo-driver/v2, but
+// migrating to that would be a breaking API rewrite out of scope for a
+// routine dependency choice.
 //
 // The chain's single-writer serialization point is a multi-document ACID
 // transaction (session.WithTransaction) covering a singleton chain-state
@@ -16,17 +17,25 @@
 // repository, there is no useTransactions bool escape hatch, because
 // graudit's correctness (not just consistency-under-load) depends on the
 // transaction. NewMongoAuditLog fails fast at construction — wrapping
-// graudit.ErrReplicaSetRequired — against a standalone instance, rather
-// than silently degrading to non-transactional writes that could corrupt
-// the chain. See docs/architecture.md.
+// ErrReplicaSetRequired — against a standalone instance, rather than
+// silently degrading to non-transactional writes that could corrupt the
+// chain. See docs/architecture.md.
 //
-// Unlike grcache/mongostore, there is no TTL index anywhere in this backend —
-// audit entries are never expired.
-package mongostore
+// There is no TTL index anywhere in this backend — audit entries are never
+// expired.
+//
+// This file was previously the standalone graudit/mongostore package,
+// renamed away from the bare "mongo" name only because it collided with
+// the upstream driver's own package (also "package mongo") for a consumer
+// importing both in the same file. As a file within one flat package
+// rather than a separate importable package, that collision no longer
+// applies, so the shorter "mongo" name (file name and error-message
+// prefix) is safe again — matching grcache's own mongostore -> mongo
+// reversion during its own flattening.
+package graudit
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -38,13 +47,12 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 
-	"github.com/gourdian25/graudit"
 	"github.com/gourdian25/grevents"
 )
 
 const (
 	defaultCollection = "graudit_entries"
-	chainStateID      = "tail"
+	chainStateID       = "tail"
 )
 
 // entryDocument is the BSON document shape for a single chain entry.
@@ -60,20 +68,20 @@ type entryDocument struct {
 	PrevHash   string    `bson:"prevHash"`
 }
 
-func (d entryDocument) toAuditEvent() (graudit.AuditEvent, error) {
-	payload, err := graudit.DecodeStoredPayload(d.Payload)
+func (d entryDocument) toAuditEvent() (AuditEvent, error) {
+	payload, err := DecodeStoredPayload(d.Payload)
 	if err != nil {
-		return graudit.AuditEvent{}, err
+		return AuditEvent{}, err
 	}
-	return graudit.AuditEvent{
-		ID: graudit.EntryID(d.EntryID), ActorID: d.ActorID, EntityType: d.EntityType, EntityID: d.EntityID,
+	return AuditEvent{
+		ID: EntryID(d.EntryID), ActorID: d.ActorID, EntityType: d.EntityType, EntityID: d.EntityID,
 		Action: d.Action, Payload: payload, Timestamp: d.Timestamp.UTC(), Hash: d.Hash, PrevHash: d.PrevHash,
 	}, nil
 }
 
-// chainState is the singleton tail document tracking the chain's current
-// end, stored in its own collection (<Collection>_chain_state).
-type chainState struct {
+// mongoChainState is the singleton tail document tracking the chain's
+// current end, stored in its own collection (<Collection>_chain_state).
+type mongoChainState struct {
 	ID          string `bson:"_id"`
 	LastEntryID uint64 `bson:"lastEntryId"`
 	LastHash    string `bson:"lastHash"`
@@ -95,7 +103,7 @@ type MongoConfig struct {
 
 	// Logger receives optional diagnostic messages. A nil Logger disables
 	// logging.
-	Logger graudit.Logger
+	Logger Logger
 
 	// EventBus, if set, receives one TopicAuditRecorded event per
 	// successful Record/RecordChange. A nil EventBus (the default) means
@@ -110,57 +118,60 @@ func (cfg MongoConfig) withDefaults() MongoConfig {
 	return cfg
 }
 
-// AuditLog is a MongoDB-backed implementation of graudit.AuditLog.
-type AuditLog struct {
-	client     *mongo.Client
-	entries    *mongo.Collection
-	chainColl  *mongo.Collection
-	logger     graudit.Logger
-	bus        grevents.Bus
+// mongoAuditLog is a MongoDB-backed implementation of AuditLog.
+type mongoAuditLog struct {
+	client    *mongo.Client
+	entries   *mongo.Collection
+	chainColl *mongo.Collection
+	logger    Logger
+	bus       grevents.Bus
 
 	closed    atomic.Bool
 	closeOnce sync.Once
 }
 
-var _ graudit.AuditLog = (*AuditLog)(nil)
+var _ AuditLog = (*mongoAuditLog)(nil)
 
 // NewMongoAuditLog connects to cfg.URI, validates connectivity with Ping,
 // probes that the deployment supports multi-document transactions (failing
-// fast, wrapping graudit.ErrReplicaSetRequired, if it does not), ensures
-// indexes exist, and returns a ready-to-use AuditLog.
+// fast, wrapping ErrReplicaSetRequired, if it does not), ensures indexes
+// exist, and returns a ready-to-use AuditLog.
 //
 // Parameters:
 //   - cfg: MongoConfig — URI and Database are required
 //
 // Returns:
-//   - graudit.AuditLog: ready to use
+//   - AuditLog: ready to use
 //   - error: non-nil if URI/Database is empty, the connection/Ping fails
-//     (wrapping graudit.ErrBackendUnavailable), the deployment is not a
-//     replica set (wrapping graudit.ErrReplicaSetRequired), or index
-//     creation fails
-func NewMongoAuditLog(cfg MongoConfig) (graudit.AuditLog, error) {
+//     (wrapping ErrBackendUnavailable), the deployment is not a replica set
+//     (wrapping ErrReplicaSetRequired), or index creation fails
+//
+// Example:
+//
+//	log, err := graudit.NewMongoAuditLog(graudit.MongoConfig{URI: uri, Database: "myapp"})
+func NewMongoAuditLog(cfg MongoConfig) (AuditLog, error) {
 	if cfg.URI == "" {
-		return nil, fmt.Errorf("graudit/mongostore: MongoConfig.URI is required")
+		return nil, fmt.Errorf("graudit/mongo: MongoConfig.URI is required")
 	}
 	if cfg.Database == "" {
-		return nil, fmt.Errorf("graudit/mongostore: MongoConfig.Database is required")
+		return nil, fmt.Errorf("graudit/mongo: MongoConfig.Database is required")
 	}
 	cfg = cfg.withDefaults()
-	appLogger := graudit.OrNop(cfg.Logger)
+	appLogger := OrNop(cfg.Logger)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(cfg.URI))
 	if err != nil {
-		appLogger.Errorf("graudit/mongostore: connect failed: %v", err)
-		return nil, fmt.Errorf("graudit/mongostore: connect: %w", graudit.ErrBackendUnavailable)
+		appLogger.Errorf("graudit/mongo: connect failed: %v", err)
+		return nil, fmt.Errorf("graudit/mongo: connect: %w", ErrBackendUnavailable)
 	}
 
 	if err := client.Ping(ctx, readpref.Primary()); err != nil {
 		_ = client.Disconnect(ctx)
-		appLogger.Errorf("graudit/mongostore: ping failed: %v", err)
-		return nil, fmt.Errorf("graudit/mongostore: ping: %w", graudit.ErrBackendUnavailable)
+		appLogger.Errorf("graudit/mongo: ping failed: %v", err)
+		return nil, fmt.Errorf("graudit/mongo: ping: %w", ErrBackendUnavailable)
 	}
 
 	db := client.Database(cfg.Database)
@@ -169,20 +180,20 @@ func NewMongoAuditLog(cfg MongoConfig) (graudit.AuditLog, error) {
 
 	if err := probeTransactionSupport(ctx, client, chainColl); err != nil {
 		_ = client.Disconnect(ctx)
-		appLogger.Errorf("graudit/mongostore: transaction probe failed: %v", err)
-		return nil, fmt.Errorf("graudit/mongostore: %w", graudit.ErrReplicaSetRequired)
+		appLogger.Errorf("graudit/mongo: transaction probe failed: %v", err)
+		return nil, fmt.Errorf("graudit/mongo: %w", ErrReplicaSetRequired)
 	}
 
-	if err := ensureIndexes(ctx, entries); err != nil {
+	if err := ensureAuditIndexes(ctx, entries); err != nil {
 		_ = client.Disconnect(ctx)
-		return nil, fmt.Errorf("graudit/mongostore: ensure indexes: %w", err)
+		return nil, fmt.Errorf("graudit/mongo: ensure indexes: %w", err)
 	}
 
-	appLogger.Infof("graudit/mongostore: connected to database %q collection %q", cfg.Database, cfg.Collection)
-	return &AuditLog{client: client, entries: entries, chainColl: chainColl, logger: appLogger, bus: cfg.EventBus}, nil
+	appLogger.Infof("graudit/mongo: connected to database %q collection %q", cfg.Database, cfg.Collection)
+	return &mongoAuditLog{client: client, entries: entries, chainColl: chainColl, logger: appLogger, bus: cfg.EventBus}, nil
 }
 
-// probeProbeDocID is a reserved chain-state document ID used only by
+// probeDocID is a reserved chain-state document ID used only by
 // probeTransactionSupport, distinct from chainStateID ("tail") so it can
 // never collide with the real tail document.
 const probeDocID = "__graudit_transaction_probe__"
@@ -217,7 +228,7 @@ func probeTransactionSupport(ctx context.Context, client *mongo.Client, chainCol
 	return err
 }
 
-func ensureIndexes(ctx context.Context, entries *mongo.Collection) error {
+func ensureAuditIndexes(ctx context.Context, entries *mongo.Collection) error {
 	models := []mongo.IndexModel{
 		{Keys: bson.D{{Key: "entryId", Value: 1}}, Options: options.Index().SetUnique(true)},
 		{Keys: bson.D{{Key: "actorId", Value: 1}}},
@@ -228,15 +239,15 @@ func ensureIndexes(ctx context.Context, entries *mongo.Collection) error {
 	return err
 }
 
-// Record implements graudit.AuditLog.Record; see the interface's doc
-// comment for the full contract and the package doc comment for the
-// transaction-based serialization strategy.
-func (a *AuditLog) Record(ctx context.Context, event graudit.AuditEvent) (graudit.EntryID, error) {
+// Record implements AuditLog.Record; see the interface's doc comment for
+// the full contract and the package doc comment for the transaction-based
+// serialization strategy.
+func (a *mongoAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID, error) {
 	if a.closed.Load() {
-		return 0, graudit.ErrClosed
+		return 0, ErrClosed
 	}
 	if err := event.Validate(); err != nil {
-		return 0, fmt.Errorf("graudit/mongostore: record: %w", err)
+		return 0, fmt.Errorf("graudit/mongo: record: %w", err)
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
@@ -244,34 +255,34 @@ func (a *AuditLog) Record(ctx context.Context, event graudit.AuditEvent) (graudi
 
 	payloadBytes, err := marshalPayload(event.Payload)
 	if err != nil {
-		return 0, fmt.Errorf("graudit/mongostore: record: %w", err)
+		return 0, fmt.Errorf("graudit/mongo: record: %w", err)
 	}
 
 	session, err := a.client.StartSession()
 	if err != nil {
-		return 0, fmt.Errorf("graudit/mongostore: record: %w", graudit.ErrBackendUnavailable)
+		return 0, fmt.Errorf("graudit/mongo: record: %w", ErrBackendUnavailable)
 	}
 	defer session.EndSession(ctx)
 
-	var recorded graudit.AuditEvent
+	var recorded AuditEvent
 	// session.WithTransaction already retries internally on
 	// TransientTransactionError/UnknownTransactionCommitResult — do not add
 	// a second, manual outer retry loop around it; that would be redundant.
 	_, err = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
-		var tail chainState
+		var tail mongoChainState
 		tailErr := a.chainColl.FindOne(sc, bson.M{"_id": chainStateID}).Decode(&tail)
-		prevHash := graudit.GenesisPrevHash
-		nextID := graudit.EntryID(1)
+		prevHash := GenesisPrevHash
+		nextID := EntryID(1)
 		switch {
 		case tailErr == nil:
-			prevHash, nextID = tail.LastHash, graudit.EntryID(tail.LastEntryID)+1
+			prevHash, nextID = tail.LastHash, EntryID(tail.LastEntryID)+1
 		case errors.Is(tailErr, mongo.ErrNoDocuments):
 			// genesis: no tail doc yet
 		default:
 			return nil, tailErr
 		}
 
-		hash, err := graudit.ComputeHash(nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
+		hash, err := ComputeHash(nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
 		if err != nil {
 			return nil, err
 		}
@@ -285,7 +296,7 @@ func (a *AuditLog) Record(ctx context.Context, event graudit.AuditEvent) (graudi
 		}
 
 		if _, err := a.chainColl.ReplaceOne(sc, bson.M{"_id": chainStateID},
-			chainState{ID: chainStateID, LastEntryID: uint64(nextID), LastHash: hash},
+			mongoChainState{ID: chainStateID, LastEntryID: uint64(nextID), LastHash: hash},
 			options.Replace().SetUpsert(true)); err != nil {
 			return nil, err
 		}
@@ -295,30 +306,30 @@ func (a *AuditLog) Record(ctx context.Context, event graudit.AuditEvent) (graudi
 		return nil, nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("graudit/mongostore: record: %w", graudit.ErrBackendUnavailable)
+		return 0, fmt.Errorf("graudit/mongo: record: %w", ErrBackendUnavailable)
 	}
 
-	graudit.PublishRecorded(ctx, a.bus, a.logger, recorded)
+	PublishRecorded(ctx, a.bus, a.logger, recorded)
 	return recorded.ID, nil
 }
 
-// RecordChange implements graudit.AuditLog.RecordChange; see the
-// interface's doc comment for the full contract.
-func (a *AuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (graudit.EntryID, error) {
-	event, err := graudit.BuildChangeEvent(actorID, entityType, entityID, before, after)
+// RecordChange implements AuditLog.RecordChange; see the interface's doc
+// comment for the full contract.
+func (a *mongoAuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error) {
+	event, err := BuildChangeEvent(actorID, entityType, entityID, before, after)
 	if err != nil {
-		return 0, fmt.Errorf("graudit/mongostore: record change: %w", err)
+		return 0, fmt.Errorf("graudit/mongo: record change: %w", err)
 	}
 	return a.Record(ctx, event)
 }
 
-// Verify applies the same two-check design as graudit/postgres: Check A
-// recomputes each entry's hash from its own stored fields and compares
-// against its stored Hash; Check B asserts each entry's stored PrevHash
-// equals the immediately preceding entry's stored Hash.
-func (a *AuditLog) Verify(ctx context.Context, from, to graudit.EntryID) (bool, graudit.VerifyResult, error) {
+// Verify applies the same two-check design as graudit's postgres backend:
+// Check A recomputes each entry's hash from its own stored fields and
+// compares against its stored Hash; Check B asserts each entry's stored
+// PrevHash equals the immediately preceding entry's stored Hash.
+func (a *mongoAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, VerifyResult, error) {
 	if a.closed.Load() {
-		return false, graudit.VerifyResult{}, graudit.ErrClosed
+		return false, VerifyResult{}, ErrClosed
 	}
 	if from < 1 {
 		from = 1
@@ -328,51 +339,51 @@ func (a *AuditLog) Verify(ctx context.Context, from, to graudit.EntryID) (bool, 
 		bson.M{"entryId": bson.M{"$gte": uint64(from), "$lte": uint64(to)}},
 		options.Find().SetSort(bson.D{{Key: "entryId", Value: 1}}))
 	if err != nil {
-		return false, graudit.VerifyResult{}, fmt.Errorf("graudit/mongostore: verify: %w", graudit.ErrBackendUnavailable)
+		return false, VerifyResult{}, fmt.Errorf("graudit/mongo: verify: %w", ErrBackendUnavailable)
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
 	var docs []entryDocument
 	if err := cursor.All(ctx, &docs); err != nil {
-		return false, graudit.VerifyResult{}, fmt.Errorf("graudit/mongostore: verify: %w", graudit.ErrBackendUnavailable)
+		return false, VerifyResult{}, fmt.Errorf("graudit/mongo: verify: %w", ErrBackendUnavailable)
 	}
 
 	var prevHash string
 	for i, doc := range docs {
-		expectPrev := graudit.GenesisPrevHash
+		expectPrev := GenesisPrevHash
 		if i > 0 {
 			expectPrev = prevHash
 		}
 		if doc.PrevHash != expectPrev {
-			return false, graudit.VerifyResult{
-				Valid: false, BrokenAt: graudit.EntryID(doc.EntryID), Expected: expectPrev, Actual: doc.PrevHash,
+			return false, VerifyResult{
+				Valid: false, BrokenAt: EntryID(doc.EntryID), Expected: expectPrev, Actual: doc.PrevHash,
 			}, nil
 		}
 
-		payload, err := graudit.DecodeStoredPayload(doc.Payload)
+		payload, err := DecodeStoredPayload(doc.Payload)
 		if err != nil {
-			return false, graudit.VerifyResult{}, fmt.Errorf("graudit/mongostore: verify: %w", err)
+			return false, VerifyResult{}, fmt.Errorf("graudit/mongo: verify: %w", err)
 		}
-		recomputed, err := graudit.ComputeHash(graudit.EntryID(doc.EntryID), doc.ActorID, doc.EntityType, doc.EntityID, doc.Action, payload, doc.Timestamp, doc.PrevHash)
+		recomputed, err := ComputeHash(EntryID(doc.EntryID), doc.ActorID, doc.EntityType, doc.EntityID, doc.Action, payload, doc.Timestamp, doc.PrevHash)
 		if err != nil {
-			return false, graudit.VerifyResult{}, fmt.Errorf("graudit/mongostore: verify: %w", err)
+			return false, VerifyResult{}, fmt.Errorf("graudit/mongo: verify: %w", err)
 		}
 		if recomputed != doc.Hash {
-			return false, graudit.VerifyResult{
-				Valid: false, BrokenAt: graudit.EntryID(doc.EntryID), Expected: recomputed, Actual: doc.Hash,
+			return false, VerifyResult{
+				Valid: false, BrokenAt: EntryID(doc.EntryID), Expected: recomputed, Actual: doc.Hash,
 			}, nil
 		}
 
 		prevHash = doc.Hash
 	}
-	return true, graudit.VerifyResult{Valid: true}, nil
+	return true, VerifyResult{Valid: true}, nil
 }
 
-// Query implements graudit.AuditLog.Query; see the interface's doc comment
-// for the full contract.
-func (a *AuditLog) Query(ctx context.Context, filter graudit.QueryFilter) ([]graudit.AuditEvent, error) {
+// Query implements AuditLog.Query; see the interface's doc comment for the
+// full contract.
+func (a *mongoAuditLog) Query(ctx context.Context, filter QueryFilter) ([]AuditEvent, error) {
 	if a.closed.Load() {
-		return nil, graudit.ErrClosed
+		return nil, ErrClosed
 	}
 
 	q := bson.M{}
@@ -403,46 +414,35 @@ func (a *AuditLog) Query(ctx context.Context, filter graudit.QueryFilter) ([]gra
 
 	cursor, err := a.entries.Find(ctx, q, opts)
 	if err != nil {
-		return nil, fmt.Errorf("graudit/mongostore: query: %w", graudit.ErrBackendUnavailable)
+		return nil, fmt.Errorf("graudit/mongo: query: %w", ErrBackendUnavailable)
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
 	var docs []entryDocument
 	if err := cursor.All(ctx, &docs); err != nil {
-		return nil, fmt.Errorf("graudit/mongostore: query: %w", graudit.ErrBackendUnavailable)
+		return nil, fmt.Errorf("graudit/mongo: query: %w", ErrBackendUnavailable)
 	}
 
-	out := make([]graudit.AuditEvent, 0, len(docs))
+	out := make([]AuditEvent, 0, len(docs))
 	for _, doc := range docs {
 		event, err := doc.toAuditEvent()
 		if err != nil {
-			return nil, fmt.Errorf("graudit/mongostore: query: %w", err)
+			return nil, fmt.Errorf("graudit/mongo: query: %w", err)
 		}
 		out = append(out, event)
 	}
 	return out, nil
 }
 
-// Close implements graudit.AuditLog.Close; idempotent via sync.Once.
-func (a *AuditLog) Close() error {
+// Close implements AuditLog.Close; idempotent via sync.Once.
+func (a *mongoAuditLog) Close() error {
 	var err error
 	a.closeOnce.Do(func() {
 		a.closed.Store(true)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		err = a.client.Disconnect(ctx)
-		a.logger.Infof("graudit/mongostore: audit log closed")
+		a.logger.Infof("graudit/mongo: audit log closed")
 	})
 	return err
-}
-
-func marshalPayload(payload any) ([]byte, error) {
-	if payload == nil {
-		return nil, nil
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("%w: payload is not JSON-serializable: %v", graudit.ErrInvalidEvent, err)
-	}
-	return raw, nil
 }

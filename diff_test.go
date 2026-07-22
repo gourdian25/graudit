@@ -138,6 +138,21 @@ func TestComputeDiff_UnmarshalableValueErrors(t *testing.T) {
 	}
 }
 
+func TestComputeDiff_AfterUnmarshalableValueErrors(t *testing.T) {
+	if _, err := computeDiff(map[string]any{}, make(chan int)); err == nil {
+		t.Fatal("expected an error for a channel value in after")
+	}
+}
+
+func TestNormalizeToObject_NonObjectValueErrors(t *testing.T) {
+	// A syntactically valid JSON value (an array) that isn't a JSON
+	// object — normalizeToObject must reject it, not silently decode into
+	// a zero-value map.
+	if _, err := normalizeToObject([]int{1, 2, 3}); err == nil {
+		t.Fatal("expected an error for a non-object (array) value")
+	}
+}
+
 func TestValueOrNil(t *testing.T) {
 	if v := valueOrNil(false, "ignored"); v != nil {
 		t.Fatalf("expected nil, got %v", v)

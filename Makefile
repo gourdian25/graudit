@@ -6,7 +6,7 @@
 
 GO := go
 MODULE := github.com/gourdian25/graudit
-COVERAGE_MIN := 80
+COVERAGE_MIN := 95
 VERSION ?=
 
 help:
@@ -16,7 +16,7 @@ help:
 	@echo "  make race             Run tests with race detector (mandatory before any commit touching the hash-chain or serialization code)"
 	@echo "  make coverage         Generate HTML coverage report"
 	@echo "  make coverage-summary Show coverage summary by function"
-	@echo "  make coverage-check   Check each package meets the $(COVERAGE_MIN)% threshold"
+	@echo "  make coverage-check   Check the root package meets the $(COVERAGE_MIN)% threshold"
 	@echo "  make bench            Run benchmarks"
 	@echo "  make lint             Run linters (requires golangci-lint)"
 	@echo "  make vet              Run go vet"
@@ -50,26 +50,24 @@ coverage-summary:
 	@$(GO) test -coverprofile=coverage.out ./...
 	@$(GO) tool cover -func=coverage.out
 
-# Requires local Postgres/MongoDB (see README) — every non-test-helper
-# package must independently meet COVERAGE_MIN, matching grcache's own
-# per-package coverage-check convention. The conformance package (no
-# _test.go of its own) and example (a runnable demo, not library code
-# under test) are skipped.
+# Requires local Postgres/MongoDB (see README) — checks only the root
+# package against COVERAGE_MIN. Before flattening, this looped over one
+# directory per backend subpackage plus root, including a stale "./mongo"
+# entry that never matched the actual "mongostore" directory name and so
+# silently reported "no coverage output" for it on every run — moot now
+# that there's only one package to measure. example/ (a runnable demo, not
+# library code under test) is excluded.
 coverage-check:
-	@echo "Checking each package meets $(COVERAGE_MIN)% coverage..."
-	@fail=0; \
-	for pkg in . ./memory ./postgres ./mongo; do \
-		out=$$($(GO) test -cover $$pkg 2>&1); \
-		pct=$$(echo "$$out" | grep -o '[0-9.]*%' | tr -d '%'); \
-		if [ -z "$$pct" ]; then echo "FAIL $$pkg: no coverage output"; fail=1; continue; fi; \
-		below=$$(awk -v p="$$pct" -v m="$(COVERAGE_MIN)" 'BEGIN { print (p < m) ? 1 : 0 }'); \
-		if [ "$$below" = "1" ]; then \
-			echo "FAIL $$pkg: $$pct% is below $(COVERAGE_MIN)% threshold"; fail=1; \
-		else \
-			echo "OK $$pkg: $$pct%"; \
-		fi; \
-	done; \
-	exit $$fail
+	@echo "Checking the root package meets $(COVERAGE_MIN)% coverage..."
+	@out=$$($(GO) test -cover . 2>&1); \
+	pct=$$(echo "$$out" | grep -o '[0-9.]*%' | tr -d '%'); \
+	if [ -z "$$pct" ]; then echo "FAIL: no coverage output"; exit 1; fi; \
+	below=$$(awk -v p="$$pct" -v m="$(COVERAGE_MIN)" 'BEGIN { print (p < m) ? 1 : 0 }'); \
+	if [ "$$below" = "1" ]; then \
+		echo "FAIL: $$pct% is below $(COVERAGE_MIN)% threshold"; exit 1; \
+	else \
+		echo "OK: $$pct%"; \
+	fi
 
 bench:
 	@echo "Running benchmarks..."

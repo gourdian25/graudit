@@ -18,7 +18,8 @@ together:
 - [grlog](https://github.com/gourdian25/grlog) — zero-dependency structured
   logging; graudit's optional `Logger` interface is satisfied by it directly.
 - [grcache](https://github.com/gourdian25/grcache) — backend-agnostic
-  caching abstraction, mirroring graudit's own subpackage-per-backend layout.
+  caching abstraction, the same interface-plus-multiple-backends pattern
+  graudit uses, both flattened into a single package.
 - [grevents](https://github.com/gourdian25/grevents) — an in-process event
   bus; graudit publishes an `"audit.recorded"` event through it on every
   successful write (see below).
@@ -51,11 +52,10 @@ import (
 	"log"
 
 	"github.com/gourdian25/graudit"
-	"github.com/gourdian25/graudit/memory"
 )
 
 func main() {
-	auditLog, err := memory.NewMemoryAuditLog()
+	auditLog, err := graudit.NewMemoryAuditLog()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -80,26 +80,25 @@ See [example/example.go](example/example.go) for a fuller runnable demo
 
 ## Backends
 
-Each backend lives in its own importable subpackage so consumers who only
-need one backend don't pull in the others' client libraries.
+graudit is a flat, single package — every backend's constructor and
+Config/Option type live directly in `github.com/gourdian25/graudit`, no
+subpackages to import selectively.
 
-| Backend | Package | Use case | Serialization |
+| Backend | Constructor | Use case | Serialization |
 |---|---|---|---|
-| In-memory | `graudit/memory` | Test/dev only — never for anything you need to keep | `sync.Mutex` |
-| PostgreSQL | `graudit/postgres` | Production | `pg_advisory_xact_lock` + explicitly-assigned `EntryID` |
-| MongoDB | `graudit/mongostore` | Production (requires a replica set) | Multi-document ACID transaction |
+| In-memory | `NewMemoryAuditLog` | Test/dev only — never for anything you need to keep | `sync.Mutex` |
+| PostgreSQL | `NewPostgresAuditLog` | Production | `pg_advisory_xact_lock` + explicitly-assigned `EntryID` |
+| MongoDB | `NewMongoAuditLog` | Production (requires a replica set) | Multi-document ACID transaction |
 
 ```go
-// Postgres
-import "github.com/gourdian25/graudit/postgres"
-auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+// Postgres — pgx/v5 with sqlc-generated queries, no ORM.
+auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	DSN: "host=localhost user=myuser password=mypass dbname=mydb port=5432 sslmode=disable",
 })
 
 // MongoDB — must be a replica set (single-node is sufficient); construction
 // fails fast otherwise, wrapping graudit.ErrReplicaSetRequired.
-import "github.com/gourdian25/graudit/mongostore"
-auditLog, err := mongostore.NewMongoAuditLog(mongostore.MongoConfig{
+auditLog, err := graudit.NewMongoAuditLog(graudit.MongoConfig{
 	URI:      "mongodb://localhost:27017/?replicaSet=rs0",
 	Database: "myapp",
 })
@@ -120,7 +119,7 @@ channel on top of it.
 import "github.com/gourdian25/grevents"
 
 bus, _ := grevents.NewBus()
-auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	DSN:      dsn,
 	EventBus: bus,
 })
@@ -140,13 +139,13 @@ proof, and [example/example.go](example/example.go) for a runnable demo.
 import "github.com/gourdian25/grlog"
 
 logger := grlog.NewDefaultLogger()
-auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	DSN:    dsn,
 	Logger: logger, // *grlog.Logger satisfies graudit.Logger directly
 })
 
-// memory takes an Option instead of a Config field:
-auditLog, err := memory.NewMemoryAuditLog(memory.WithLogger(logger))
+// memory takes MemoryOption functional options instead of a Config field:
+auditLog, err := graudit.NewMemoryAuditLog(graudit.WithLogger(logger))
 ```
 
 ## `Verify()` semantics
@@ -184,9 +183,9 @@ the workspace-wide standard. A second, genuinely standalone (no `--replSet`,
 no auth) instance is also started, required by
 `TestNewMongoAuditLog_RequiresReplicaSet` — the one test that actually
 proves construction fails fast against a non-replica-set deployment (see
-`mongostore/mongostore_test.go`'s comment for why this test must never be
-skipped: an earlier version of this exact test caught a real bug where the
-fail-fast check silently passed against a standalone instance).
+`mongo_test.go`'s comment for why this test must never be skipped: an
+earlier version of this exact test caught a real bug where the fail-fast
+check silently passed against a standalone instance).
 
 The Mongo backend additionally requires the instance to be configured as a
 replica set (single-node is sufficient) — construction fails fast against
@@ -195,15 +194,18 @@ a standalone instance.
 ```sh
 make test             # go test -cover ./...
 make race             # go test -race ./...  (mandatory before any commit touching the hash-chain or serialization code)
-make coverage-check   # verify every package independently meets 80% coverage
+make coverage-check   # verify the root package meets 95% coverage
 make bench            # go test -bench=. -benchmem -benchtime=10s ./...
 make lint             # golangci-lint run ./...
 ```
 
-A shared `conformance` package runs one behavioral suite (hash-chain
-integrity, concurrent-write ordering, deliberate-tamper detection, hash
-determinism, grevents publish/publish-failure) against all three backends
-through the `AuditLog` interface.
+A shared contract test suite (`contract_audit_test.go`, run via
+`TestAuditLog_Contract`'s per-backend subtests) runs one behavioral suite
+(hash-chain integrity, concurrent-write ordering, deliberate-tamper
+detection, hash determinism, grevents publish/publish-failure) against all
+three backends through the `AuditLog` interface — folded from a standalone
+`conformance` package into the root package's own tests, matching the rest
+of the gourdian ecosystem's convention.
 
 ## Out of scope (v1)
 

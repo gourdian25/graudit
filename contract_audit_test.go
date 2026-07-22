@@ -1,17 +1,19 @@
-// File: conformance/conformance.go
+// File: contract_audit_test.go
 
-// Package conformance is a shared behavioral test suite run against every
-// graudit backend via the common graudit.AuditLog interface. It enforces
-// identical behavior across backends for every scenario it covers (see Run)
-// and is the primary test artifact for each backend package, which
-// supplies its own constructors to Run and adds backend-specific tests
-// (e.g. connection-failure handling, replica-set requirements) separately.
+// White-box (package graudit, not graudit_test) specifically so the memory
+// backend's tamper hook can reach memoryAuditLog's unexported fields
+// directly — memory's entire state lives in-process with no separate
+// storage to connect to independently, unlike the postgres/mongo tamper
+// hooks, which connect via a raw client/driver call to the same known test
+// DSN/URI instead.
 //
-// This package imports only the root graudit package, never a backend
-// subpackage — each backend's own test file imports conformance sideways,
-// which is what avoids an import cycle in the subpackage-per-backend
-// layout.
-package conformance
+// This was originally a separate, publicly-importable conformance package
+// (graudit/conformance, imported sideways by each backend subpackage's own
+// test file to avoid an import cycle in the old subpackage-per-backend
+// layout) — folded into the root package's own tests once every backend
+// lived in one flat package, matching the rest of the gourdian ecosystem's
+// convention (see grnoti's own contract_*_test.go files).
+package graudit
 
 import (
 	"context"
@@ -21,63 +23,80 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/gourdian25/graudit"
-	"github.com/gourdian25/grevents"
 )
 
-// RunOption configures Run's behavior for scenarios that need
-// backend-specific hooks.
-type RunOption func(*runConfig)
+// TestAuditLog_Contract runs the full contract suite against all three
+// backends. Postgres and Mongo skip gracefully if their live local service
+// isn't reachable, matching the rest of the gourdian ecosystem's
+// convention; the in-memory backend never skips, since it has no external
+// dependency to be unavailable.
+func TestAuditLog_Contract(t *testing.T) {
+	t.Run("Memory", func(t *testing.T) {
+		runAuditContract(t, newMemoryLog, newMemoryLogWithBus, withTamperHook(tamperMemoryEntry))
+	})
 
-// TamperHook mutates one entry's stored Payload directly, bypassing the
+	t.Run("Postgres", func(t *testing.T) {
+		log, err := newPostgresLog()
+		if err != nil {
+			t.Skipf("PostgreSQL not available, skipping: %v", err)
+		}
+		_ = log.Close()
+		runAuditContract(t, newPostgresLog, newPostgresLogWithBus, withTamperHook(tamperPostgresEntry))
+	})
+
+	t.Run("Mongo", func(t *testing.T) {
+		log, err := newMongoLog()
+		if err != nil {
+			t.Skipf("MongoDB not available, skipping: %v", err)
+		}
+		_ = log.Close()
+		runAuditContract(t, newMongoLog, newMongoLogWithBus, withTamperHook(tamperMongoEntry))
+	})
+}
+
+// auditContractOption configures runAuditContract's behavior for scenarios
+// that need backend-specific hooks.
+type auditContractOption func(*auditContractConfig)
+
+// tamperHookFunc mutates one entry's stored Payload directly, bypassing the
 // AuditLog interface entirely — raw SQL for postgres, a raw driver call for
 // mongo (both typically ignoring log and instead connecting independently
 // to the same known test DSN/URI), or a white-box type-assertion back to
 // the concrete type for memory (whose state is only reachable in-process).
-// log is the exact instance VerifyDetectsTamper is about to re-Verify, so
-// backends that do need it (memory) have it available.
-type TamperHook func(t *testing.T, log graudit.AuditLog, entryID graudit.EntryID)
+// log is the exact instance testVerifyDetectsTamper is about to re-Verify,
+// so backends that do need it (memory) have it available.
+type tamperHookFunc func(t *testing.T, log AuditLog, entryID EntryID)
 
-type runConfig struct {
-	tamperHook TamperHook
+type auditContractConfig struct {
+	tamperHook tamperHookFunc
 }
 
-// WithTamperHook supplies the backend-specific mechanism for
-// VerifyDetectsTamper to mutate one entry's stored Payload directly,
+// withTamperHook supplies the backend-specific mechanism for
+// testVerifyDetectsTamper to mutate one entry's stored Payload directly,
 // simulating an attacker or a bug elsewhere touching storage directly. If
-// omitted, VerifyDetectsTamper is skipped with a clear message; every
+// omitted, testVerifyDetectsTamper is skipped with a clear message; every
 // backend is expected to supply one, since this is one of the plan's named
 // mandatory adversarial tests.
-func WithTamperHook(hook TamperHook) RunOption {
-	return func(cfg *runConfig) { cfg.tamperHook = hook }
+func withTamperHook(hook tamperHookFunc) auditContractOption {
+	return func(cfg *auditContractConfig) { cfg.tamperHook = hook }
 }
 
-// NewLogFunc constructs a fresh, empty AuditLog for one scenario.
-type NewLogFunc func() (graudit.AuditLog, error)
+// newLogFunc constructs a fresh, empty AuditLog for one scenario.
+type newLogFunc func() (AuditLog, error)
 
-// NewLogWithBusFunc constructs a fresh, empty AuditLog wired to bus — used
+// newLogWithBusFunc constructs a fresh, empty AuditLog wired to bus — used
 // only by the PublishOnRecord/PublishFailureDoesNotFailRecord scenarios,
 // which need to inject a test-double grevents.Bus. Every backend supports
 // this since EventBus/WithEventBus is a standard Config/Option field.
-type NewLogWithBusFunc func(bus grevents.Bus) (graudit.AuditLog, error)
+type newLogWithBusFunc func(bus *stubBus) (AuditLog, error)
 
-// Run executes the full conformance suite. Every backend's own test file
-// calls this with its own constructors so the same behavioral assertions
-// run identically against all three backends.
-//
-// Example:
-//
-//	func TestConformance(t *testing.T) {
-//		conformance.Run(t,
-//			func() (graudit.AuditLog, error) { return memory.NewMemoryAuditLog() },
-//			func(bus grevents.Bus) (graudit.AuditLog, error) { return memory.NewMemoryAuditLog(memory.WithEventBus(bus)) },
-//		)
-//	}
-func Run(t *testing.T, newLog NewLogFunc, newLogWithBus NewLogWithBusFunc, opts ...RunOption) {
+// runAuditContract executes the full contract suite. TestAuditLog_Contract
+// calls this once per backend with that backend's own constructors so the
+// same behavioral assertions run identically against all three.
+func runAuditContract(t *testing.T, newLog newLogFunc, newLogWithBus newLogWithBusFunc, opts ...auditContractOption) {
 	t.Helper()
 
-	cfg := &runConfig{}
+	cfg := &auditContractConfig{}
 	for _, opt := range opts {
 		opt(cfg)
 	}
@@ -95,7 +114,7 @@ func Run(t *testing.T, newLog NewLogFunc, newLogWithBus NewLogWithBusFunc, opts 
 	t.Run("PostClose", func(t *testing.T) { testPostClose(t, newLog) })
 }
 
-func testGenesisEntry(t *testing.T, newLog NewLogFunc) {
+func testGenesisEntry(t *testing.T, newLog newLogFunc) {
 	t.Helper()
 	ctx := context.Background()
 	log, err := newLog()
@@ -104,7 +123,7 @@ func testGenesisEntry(t *testing.T, newLog NewLogFunc) {
 	}
 	defer log.Close()
 
-	id, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create"})
+	id, err := log.Record(ctx, AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create"})
 	if err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -112,19 +131,19 @@ func testGenesisEntry(t *testing.T, newLog NewLogFunc) {
 		t.Fatalf("first Record returned EntryID %d, want 1", id)
 	}
 
-	entries, err := log.Query(ctx, graudit.QueryFilter{})
+	entries, err := log.Query(ctx, QueryFilter{})
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
 	if len(entries) != 1 {
 		t.Fatalf("Query returned %d entries, want 1", len(entries))
 	}
-	if entries[0].PrevHash != graudit.GenesisPrevHash {
+	if entries[0].PrevHash != GenesisPrevHash {
 		t.Fatalf("genesis entry PrevHash = %q, want GenesisPrevHash", entries[0].PrevHash)
 	}
 }
 
-func testSequentialEntryIDs(t *testing.T, newLog NewLogFunc) {
+func testSequentialEntryIDs(t *testing.T, newLog newLogFunc) {
 	t.Helper()
 	ctx := context.Background()
 	log, err := newLog()
@@ -135,7 +154,7 @@ func testSequentialEntryIDs(t *testing.T, newLog NewLogFunc) {
 
 	const n = 20
 	for i := 0; i < n; i++ {
-		id, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: fmt.Sprintf("w%d", i), Action: "create"})
+		id, err := log.Record(ctx, AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: fmt.Sprintf("w%d", i), Action: "create"})
 		if err != nil {
 			t.Fatalf("Record #%d: %v", i, err)
 		}
@@ -153,7 +172,7 @@ func testSequentialEntryIDs(t *testing.T, newLog NewLogFunc) {
 	}
 }
 
-func testVerifyOnSingleEntry(t *testing.T, newLog NewLogFunc) {
+func testVerifyOnSingleEntry(t *testing.T, newLog newLogFunc) {
 	t.Helper()
 	ctx := context.Background()
 	log, err := newLog()
@@ -162,7 +181,7 @@ func testVerifyOnSingleEntry(t *testing.T, newLog NewLogFunc) {
 	}
 	defer log.Close()
 
-	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create"}); err != nil {
+	if _, err := log.Record(ctx, AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create"}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
@@ -179,7 +198,7 @@ func testVerifyOnSingleEntry(t *testing.T, newLog NewLogFunc) {
 // suite: it directly proves each backend's serialization strategy (mutex /
 // advisory lock / Mongo transaction) actually works under real concurrency,
 // not just that it compiles.
-func testConcurrentRecordStress(t *testing.T, newLog NewLogFunc) {
+func testConcurrentRecordStress(t *testing.T, newLog newLogFunc) {
 	t.Helper()
 	ctx := context.Background()
 	log, err := newLog()
@@ -193,7 +212,7 @@ func testConcurrentRecordStress(t *testing.T, newLog NewLogFunc) {
 	total := workers * perWorker
 
 	var wg sync.WaitGroup
-	ids := make([]graudit.EntryID, total)
+	ids := make([]EntryID, total)
 	errs := make([]error, total)
 	wg.Add(workers)
 	for w := 0; w < workers; w++ {
@@ -201,7 +220,7 @@ func testConcurrentRecordStress(t *testing.T, newLog NewLogFunc) {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
 				idx := w*perWorker + i
-				id, err := log.Record(ctx, graudit.AuditEvent{
+				id, err := log.Record(ctx, AuditEvent{
 					ActorID: fmt.Sprintf("actor:%d", w), EntityType: "stress", EntityID: fmt.Sprintf("e%d", idx), Action: "create",
 				})
 				ids[idx] = id
@@ -211,7 +230,7 @@ func testConcurrentRecordStress(t *testing.T, newLog NewLogFunc) {
 	}
 	wg.Wait()
 
-	seen := make(map[graudit.EntryID]bool, total)
+	seen := make(map[EntryID]bool, total)
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("Record #%d: %v", i, err)
@@ -221,13 +240,13 @@ func testConcurrentRecordStress(t *testing.T, newLog NewLogFunc) {
 		}
 		seen[ids[i]] = true
 	}
-	for id := graudit.EntryID(1); id <= graudit.EntryID(total); id++ {
+	for id := EntryID(1); id <= EntryID(total); id++ {
 		if !seen[id] {
 			t.Fatalf("EntryID %d missing — chain has a gap", id)
 		}
 	}
 
-	ok, detail, err := log.Verify(ctx, 1, graudit.EntryID(total))
+	ok, detail, err := log.Verify(ctx, 1, EntryID(total))
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
@@ -241,10 +260,10 @@ func testConcurrentRecordStress(t *testing.T, newLog NewLogFunc) {
 // can't interfere) on two fresh, independent AuditLog instances — one with
 // its payload map keys in one insertion order, the other reordered — and
 // confirms the stored Hash is identical. Run end-to-end through Record and
-// Query (not just the pure unit test in the root package's hash_test.go)
-// to catch a backend accidentally re-serializing the payload differently
-// before hashing or on read-back (e.g. GORM/driver JSON reordering).
-func testHashDeterminism(t *testing.T, newLog NewLogFunc) {
+// Query (not just the pure unit test in hash_test.go) to catch a backend
+// accidentally re-serializing the payload differently before hashing or on
+// read-back.
+func testHashDeterminism(t *testing.T, newLog newLogFunc) {
 	t.Helper()
 	ctx := context.Background()
 	ts := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -257,12 +276,12 @@ func testHashDeterminism(t *testing.T, newLog NewLogFunc) {
 		}
 		defer log.Close()
 
-		if _, err := log.Record(ctx, graudit.AuditEvent{
+		if _, err := log.Record(ctx, AuditEvent{
 			ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create", Payload: payload, Timestamp: ts,
 		}); err != nil {
 			t.Fatalf("Record: %v", err)
 		}
-		entries, err := log.Query(ctx, graudit.QueryFilter{})
+		entries, err := log.Query(ctx, QueryFilter{})
 		if err != nil {
 			t.Fatalf("Query: %v", err)
 		}
@@ -280,10 +299,10 @@ func testHashDeterminism(t *testing.T, newLog NewLogFunc) {
 	}
 }
 
-func testVerifyDetectsTamper(t *testing.T, newLog NewLogFunc, tamperHook TamperHook) {
+func testVerifyDetectsTamper(t *testing.T, newLog newLogFunc, tamperHook tamperHookFunc) {
 	t.Helper()
 	if tamperHook == nil {
-		t.Skip("no WithTamperHook supplied for this backend")
+		t.Skip("no withTamperHook supplied for this backend")
 	}
 
 	ctx := context.Background()
@@ -294,9 +313,9 @@ func testVerifyDetectsTamper(t *testing.T, newLog NewLogFunc, tamperHook TamperH
 	defer log.Close()
 
 	const n = 5
-	var tamperedID graudit.EntryID
+	var tamperedID EntryID
 	for i := 0; i < n; i++ {
-		id, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: fmt.Sprintf("w%d", i), Action: "create"})
+		id, err := log.Record(ctx, AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: fmt.Sprintf("w%d", i), Action: "create"})
 		if err != nil {
 			t.Fatalf("Record #%d: %v", i, err)
 		}
@@ -323,7 +342,7 @@ func testVerifyDetectsTamper(t *testing.T, newLog NewLogFunc, tamperHook TamperH
 	}
 }
 
-func testRecordChangeDiff(t *testing.T, newLog NewLogFunc) {
+func testRecordChangeDiff(t *testing.T, newLog newLogFunc) {
 	t.Helper()
 	ctx := context.Background()
 	log, err := newLog()
@@ -340,7 +359,7 @@ func testRecordChangeDiff(t *testing.T, newLog NewLogFunc) {
 		t.Fatalf("RecordChange: %v", err)
 	}
 
-	entries, err := log.Query(ctx, graudit.QueryFilter{})
+	entries, err := log.Query(ctx, QueryFilter{})
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -349,13 +368,13 @@ func testRecordChangeDiff(t *testing.T, newLog NewLogFunc) {
 	}
 
 	// Payload's concrete Go type depends on the backend: memory preserves
-	// the original graudit.ChangeDiff value in-process, while postgres/
-	// mongo round-trip it through JSON storage and hand back a generic
+	// the original ChangeDiff value in-process, while postgres/mongo
+	// round-trip it through JSON storage and hand back a generic
 	// map[string]any (DecodeStoredPayload has no way to know the original
 	// concrete type was ChangeDiff — only the JSON shape survives). Both
 	// are correct, expected backend-specific behavior, not a bug, so this
-	// assertion normalizes through JSON rather than asserting a concrete
-	// Go type.
+	// assertion normalizes through JSON rather than asserting a concrete Go
+	// type.
 	raw, err := json.Marshal(entries[0].Payload)
 	if err != nil {
 		t.Fatalf("marshal Payload for inspection: %v", err)
@@ -375,7 +394,7 @@ func testRecordChangeDiff(t *testing.T, newLog NewLogFunc) {
 	}
 }
 
-func testQueryFilters(t *testing.T, newLog NewLogFunc) {
+func testQueryFilters(t *testing.T, newLog newLogFunc) {
 	t.Helper()
 	ctx := context.Background()
 	log, err := newLog()
@@ -386,21 +405,21 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 
 	// Explicit, well-separated timestamps (not time.Now()) so the From/To
 	// range assertions below are deterministic even under a backend whose
-	// storage only preserves millisecond precision (graudit/mongo) —
+	// storage only preserves millisecond precision (the mongo backend) —
 	// three real time.Now() calls in a tight loop can land in the same
 	// millisecond and make the range filters indistinguishable.
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create", Timestamp: base}); err != nil {
+	if _, err := log.Record(ctx, AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create", Timestamp: base}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:2", EntityType: "widget", EntityID: "w2", Action: "create", Timestamp: base.Add(time.Minute)}); err != nil {
+	if _, err := log.Record(ctx, AuditEvent{ActorID: "actor:2", EntityType: "widget", EntityID: "w2", Action: "create", Timestamp: base.Add(time.Minute)}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "gadget", EntityID: "g1", Action: "create", Timestamp: base.Add(2 * time.Minute)}); err != nil {
+	if _, err := log.Record(ctx, AuditEvent{ActorID: "actor:1", EntityType: "gadget", EntityID: "g1", Action: "create", Timestamp: base.Add(2 * time.Minute)}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
-	byActor, err := log.Query(ctx, graudit.QueryFilter{ActorID: "actor:1"})
+	byActor, err := log.Query(ctx, QueryFilter{ActorID: "actor:1"})
 	if err != nil {
 		t.Fatalf("Query(ActorID): %v", err)
 	}
@@ -408,7 +427,7 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 		t.Fatalf("Query(ActorID=actor:1) returned %d entries, want 2", len(byActor))
 	}
 
-	byEntity, err := log.Query(ctx, graudit.QueryFilter{EntityType: "widget", EntityID: "w2"})
+	byEntity, err := log.Query(ctx, QueryFilter{EntityType: "widget", EntityID: "w2"})
 	if err != nil {
 		t.Fatalf("Query(EntityType/EntityID): %v", err)
 	}
@@ -416,7 +435,7 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 		t.Fatalf("Query(EntityType=widget,EntityID=w2) returned %d entries, want 1", len(byEntity))
 	}
 
-	limited, err := log.Query(ctx, graudit.QueryFilter{Limit: 1})
+	limited, err := log.Query(ctx, QueryFilter{Limit: 1})
 	if err != nil {
 		t.Fatalf("Query(Limit): %v", err)
 	}
@@ -424,7 +443,7 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 		t.Fatalf("Query(Limit=1) returned %d entries, want 1", len(limited))
 	}
 
-	all, err := log.Query(ctx, graudit.QueryFilter{})
+	all, err := log.Query(ctx, QueryFilter{})
 	if err != nil {
 		t.Fatalf("Query(all): %v", err)
 	}
@@ -433,7 +452,7 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 	}
 	mid := all[1].Timestamp
 
-	byFrom, err := log.Query(ctx, graudit.QueryFilter{From: mid})
+	byFrom, err := log.Query(ctx, QueryFilter{From: mid})
 	if err != nil {
 		t.Fatalf("Query(From): %v", err)
 	}
@@ -441,7 +460,7 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 		t.Fatalf("Query(From=entry[1].Timestamp) returned %d entries, want 2", len(byFrom))
 	}
 
-	byTo, err := log.Query(ctx, graudit.QueryFilter{To: mid})
+	byTo, err := log.Query(ctx, QueryFilter{To: mid})
 	if err != nil {
 		t.Fatalf("Query(To): %v", err)
 	}
@@ -449,7 +468,7 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 		t.Fatalf("Query(To=entry[1].Timestamp) returned %d entries, want 2", len(byTo))
 	}
 
-	byRange, err := log.Query(ctx, graudit.QueryFilter{From: mid, To: mid})
+	byRange, err := log.Query(ctx, QueryFilter{From: mid, To: mid})
 	if err != nil {
 		t.Fatalf("Query(From,To): %v", err)
 	}
@@ -458,43 +477,7 @@ func testQueryFilters(t *testing.T, newLog NewLogFunc) {
 	}
 }
 
-// stubBus is a minimal grevents.Bus test double for PublishOnRecord and
-// PublishFailureDoesNotFailRecord — kept unexported here rather than
-// reimplemented per backend.
-type stubBus struct {
-	mu         sync.Mutex
-	published  []grevents.Event
-	publishErr error
-}
-
-func (b *stubBus) Publish(ctx context.Context, event grevents.Event) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.published = append(b.published, event)
-	return b.publishErr
-}
-func (b *stubBus) Subscribe(topic string, handler grevents.HandlerFunc, opts ...grevents.SubscribeOption) (grevents.Unsubscribe, error) {
-	return func() {}, nil
-}
-func (b *stubBus) Use(mw grevents.Middleware)                        {}
-func (b *stubBus) Stats(ctx context.Context) (grevents.Stats, error) { return grevents.Stats{}, nil }
-func (b *stubBus) Close() error                                      { return nil }
-
-func (b *stubBus) count() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.published)
-}
-
-func (b *stubBus) last() grevents.Event {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.published[len(b.published)-1]
-}
-
-var _ grevents.Bus = (*stubBus)(nil)
-
-func testPublishOnRecord(t *testing.T, newLogWithBus NewLogWithBusFunc) {
+func testPublishOnRecord(t *testing.T, newLogWithBus newLogWithBusFunc) {
 	t.Helper()
 	ctx := context.Background()
 	bus := &stubBus{}
@@ -504,7 +487,7 @@ func testPublishOnRecord(t *testing.T, newLogWithBus NewLogWithBusFunc) {
 	}
 	defer log.Close()
 
-	id, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create"})
+	id, err := log.Record(ctx, AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create"})
 	if err != nil {
 		t.Fatalf("Record: %v", err)
 	}
@@ -513,16 +496,16 @@ func testPublishOnRecord(t *testing.T, newLogWithBus NewLogWithBusFunc) {
 		t.Fatalf("expected exactly 1 Publish call, got %d", got)
 	}
 	event := bus.last()
-	if event.Topic != graudit.TopicAuditRecorded {
-		t.Fatalf("published Topic = %q, want %q", event.Topic, graudit.TopicAuditRecorded)
+	if event.Topic != TopicAuditRecorded {
+		t.Fatalf("published Topic = %q, want %q", event.Topic, TopicAuditRecorded)
 	}
-	payload, ok := event.Payload.(graudit.AuditEvent)
+	payload, ok := event.Payload.(AuditEvent)
 	if !ok || payload.ID != id {
 		t.Fatalf("published Payload = %+v, want AuditEvent with ID %d", event.Payload, id)
 	}
 }
 
-func testPublishFailureDoesNotFailRecord(t *testing.T, newLogWithBus NewLogWithBusFunc) {
+func testPublishFailureDoesNotFailRecord(t *testing.T, newLogWithBus newLogWithBusFunc) {
 	t.Helper()
 	ctx := context.Background()
 	bus := &stubBus{publishErr: errors.New("bus unavailable")}
@@ -532,7 +515,7 @@ func testPublishFailureDoesNotFailRecord(t *testing.T, newLogWithBus NewLogWithB
 	}
 	defer log.Close()
 
-	id, err := log.Record(ctx, graudit.AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create"})
+	id, err := log.Record(ctx, AuditEvent{ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Action: "create"})
 	if err != nil {
 		t.Fatalf("Record with a failing bus: %v, want nil (publish failures must not fail Record)", err)
 	}
@@ -540,7 +523,7 @@ func testPublishFailureDoesNotFailRecord(t *testing.T, newLogWithBus NewLogWithB
 		t.Fatal("Record returned a zero EntryID despite a nil error")
 	}
 
-	entries, err := log.Query(ctx, graudit.QueryFilter{})
+	entries, err := log.Query(ctx, QueryFilter{})
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -549,7 +532,12 @@ func testPublishFailureDoesNotFailRecord(t *testing.T, newLogWithBus NewLogWithB
 	}
 }
 
-func testPostClose(t *testing.T, newLog NewLogFunc) {
+// testPostClose checks every AuditLog method's behavior after Close,
+// including RecordChange — a real gap in the pre-flatten conformance suite,
+// which only ever exercised Record/Verify/Query, leaving RecordChange's
+// post-Close error wrapping (which flows through Record's own ErrClosed
+// check) unverified end-to-end.
+func testPostClose(t *testing.T, newLog newLogFunc) {
 	t.Helper()
 	ctx := context.Background()
 	log, err := newLog()
@@ -564,13 +552,16 @@ func testPostClose(t *testing.T, newLog NewLogFunc) {
 		t.Fatalf("second Close: %v, want nil (idempotent)", err)
 	}
 
-	if _, err := log.Record(ctx, graudit.AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, graudit.ErrClosed) {
+	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Record after Close error = %v, want ErrClosed", err)
 	}
-	if _, _, err := log.Verify(ctx, 1, 1); !errors.Is(err, graudit.ErrClosed) {
+	if _, err := log.RecordChange(ctx, "a", "t", "1", nil, map[string]any{"x": 1}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("RecordChange after Close error = %v, want ErrClosed", err)
+	}
+	if _, _, err := log.Verify(ctx, 1, 1); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Verify after Close error = %v, want ErrClosed", err)
 	}
-	if _, err := log.Query(ctx, graudit.QueryFilter{}); !errors.Is(err, graudit.ErrClosed) {
+	if _, err := log.Query(ctx, QueryFilter{}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Query after Close error = %v, want ErrClosed", err)
 	}
 }

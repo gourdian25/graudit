@@ -16,7 +16,6 @@ import (
 	"github.com/gourdian25/grlog"
 
 	"github.com/gourdian25/graudit"
-	"github.com/gourdian25/graudit/memory"
 )
 
 func main() {
@@ -35,7 +34,7 @@ func main() {
 	bus, _ := grevents.NewBus()
 	_ = bus.Close()
 
-	auditLog, err := memory.NewMemoryAuditLog(memory.WithLogger(logger), memory.WithEventBus(bus))
+	auditLog, err := graudit.NewMemoryAuditLog(graudit.WithLogger(logger), graudit.WithEventBus(bus))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -81,15 +80,14 @@ func main() {
 	fmt.Printf("found %d entries for invoice inv_123\n", len(entries))
 
 	// Postgres and Mongo backends are constructed with a Config instead of
-	// options, but implement the exact same graudit.AuditLog interface:
+	// options, but implement the exact same graudit.AuditLog interface —
+	// both live directly in the graudit package, no subpackage import:
 	//
-	//	import "github.com/gourdian25/graudit/postgres"
-	//	auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+	//	auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	//		DSN: "host=localhost user=myuser password=mypass dbname=mydb port=5432 sslmode=disable",
 	//	})
 	//
-	//	import "github.com/gourdian25/graudit/mongostore"
-	//	auditLog, err := mongostore.NewMongoAuditLog(mongostore.MongoConfig{
+	//	auditLog, err := graudit.NewMongoAuditLog(graudit.MongoConfig{
 	//		URI:      "mongodb://localhost:27017/?replicaSet=rs0",
 	//		Database: "myapp",
 	//	})
@@ -98,7 +96,7 @@ func main() {
 	//
 	//	import "github.com/gourdian25/grevents"
 	//	bus, _ := grevents.NewBus()
-	//	auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+	//	auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	//		DSN:      dsn,
 	//		EventBus: bus,
 	//	})

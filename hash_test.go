@@ -3,7 +3,9 @@
 package graudit
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -242,3 +244,77 @@ func TestCanonicalJSON_UnmarshalableValueErrors(t *testing.T) {
 		t.Fatal("expected an error for a channel value, got nil")
 	}
 }
+
+func TestComputeHash_UnmarshalablePayloadErrors(t *testing.T) {
+	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	if _, err := ComputeHash(1, "a", "t", "1", "create", make(chan int), ts, GenesisPrevHash); err == nil {
+		t.Fatal("expected an error for an unmarshalable payload, got nil")
+	}
+}
+
+func TestMarshalPayload_NilIsNilBytes(t *testing.T) {
+	raw, err := marshalPayload(nil)
+	if err != nil || raw != nil {
+		t.Fatalf("marshalPayload(nil) = (%v, %v), want (nil, nil)", raw, err)
+	}
+}
+
+func TestMarshalPayload_UnmarshalableValueErrors(t *testing.T) {
+	if _, err := marshalPayload(make(chan int)); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("marshalPayload(chan): err=%v, want wrapping ErrInvalidEvent", err)
+	}
+}
+
+// TestEncodeCanonical_UnsupportedTypeErrors covers encodeCanonical's
+// defensive default branch directly. canonicalJSON's own decoder always
+// normalizes into map[string]any/[]any/json.Number/string/bool/nil before
+// calling encodeCanonical, so the default case is unreachable through the
+// public API — this white-box call is the only way to exercise it.
+func TestEncodeCanonical_UnsupportedTypeErrors(t *testing.T) {
+	var buf bytes.Buffer
+	if err := encodeCanonical(&buf, 42); err == nil {
+		t.Fatal("expected an error for a plain int (not a normalized json.Number), got nil")
+	}
+}
+
+func TestEncodeCanonical_PropagatesErrorFromMapValue(t *testing.T) {
+	var buf bytes.Buffer
+	if err := encodeCanonical(&buf, map[string]any{"x": 42}); err == nil {
+		t.Fatal("expected an error propagated from an unsupported nested map value, got nil")
+	}
+}
+
+func TestEncodeCanonical_PropagatesErrorFromArrayElement(t *testing.T) {
+	var buf bytes.Buffer
+	if err := encodeCanonical(&buf, []any{42}); err == nil {
+		t.Fatal("expected an error propagated from an unsupported array element, got nil")
+	}
+}
+
+func TestEncodeCanonical_NilValue(t *testing.T) {
+	var buf bytes.Buffer
+	if err := encodeCanonical(&buf, nil); err != nil {
+		t.Fatalf("encodeCanonical(nil): %v", err)
+	}
+	if got := buf.String(); got != "null" {
+		t.Fatalf("encodeCanonical(nil) wrote %q, want %q", got, "null")
+	}
+}
+
+func TestEncodeCanonical_FalseBoolean(t *testing.T) {
+	var buf bytes.Buffer
+	if err := encodeCanonical(&buf, false); err != nil {
+		t.Fatalf("encodeCanonical(false): %v", err)
+	}
+	if got := buf.String(); got != "false" {
+		t.Fatalf("encodeCanonical(false) wrote %q, want %q", got, "false")
+	}
+}
+
+// Note: canonicalJSON's own post-Marshal re-Decode error branch (line ~151)
+// and encodeCanonical's json.Marshal-of-a-map-key/string branches (lines
+// ~180, ~208) are not exercised anywhere, including directly: a Go string
+// (a map key or a string value) can never fail json.Marshal, and
+// re-decoding canonicalJSON's own just-Marshal-ed output can never produce
+// invalid JSON. These are genuinely unreachable defensive branches, not
+// untested gaps.
