@@ -43,6 +43,6 @@ func PublishRecorded(ctx context.Context, bus grevents.Bus, logger Logger, entry
 		},
 	}
 	if err := bus.Publish(ctx, event); err != nil {
-		logger.Warnf("graudit: publish %s for entry %d failed: %v", TopicAuditRecorded, entry.ID, err)
+		logger.Warn("graudit: publish failed", "topic", TopicAuditRecorded, "entry_id", entry.ID, "error", err)
 	}
 }

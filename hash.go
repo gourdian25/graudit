@@ -105,6 +105,23 @@ func DecodeStoredPayload(raw []byte) (any, error) {
 	return v, nil
 }
 
+// marshalPayload JSON-encodes payload for durable storage (the postgres and
+// mongo backends' own Payload column/field) — the write-side counterpart of
+// DecodeStoredPayload. A nil payload marshals to nil bytes ("no payload"),
+// matching DecodeStoredPayload's own treatment of an empty/nil input. Shared
+// by both backends rather than duplicated, since it's byte-for-byte
+// identical between them.
+func marshalPayload(payload any) ([]byte, error) {
+	if payload == nil {
+		return nil, nil
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("%w: payload is not JSON-serializable: %v", ErrInvalidEvent, err)
+	}
+	return raw, nil
+}
+
 // canonicalJSON produces a deterministic JSON encoding of v: two values with
 // the same logical structure and content — including maps with different
 // key insertion order, or structs with equivalent JSON tags — always
@@ -159,10 +176,10 @@ func encodeCanonical(buf *bytes.Buffer, v any) error {
 			if i > 0 {
 				buf.WriteByte(',')
 			}
-			keyBytes, err := json.Marshal(k)
-			if err != nil {
-				return err
-			}
+			// json.Marshal of a plain Go string can never fail (invalid
+			// UTF-8 is escaped, not rejected), so there is no error branch
+			// to handle here.
+			keyBytes, _ := json.Marshal(k)
 			buf.Write(keyBytes)
 			buf.WriteByte(':')
 			if err := encodeCanonical(buf, val[k]); err != nil {
@@ -187,10 +204,9 @@ func encodeCanonical(buf *bytes.Buffer, v any) error {
 		buf.WriteString(val.String())
 
 	case string:
-		b, err := json.Marshal(val)
-		if err != nil {
-			return err
-		}
+		// Same reasoning as the map-key case above: marshaling a plain Go
+		// string can never fail.
+		b, _ := json.Marshal(val)
 		buf.Write(b)
 
 	case bool:

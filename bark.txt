@@ -7,8 +7,7 @@
 ├── SECURITY.md
 ├── audit.go
 ├── audit_test.go
-├── conformance/
-│   └── conformance.go
+├── contract_audit_test.go
 ├── diff.go
 ├── diff_test.go
 ├── docs/
@@ -25,16 +24,24 @@
 ├── go.sum
 ├── hash.go
 ├── hash_test.go
+├── internal/
+│   └── postgresdb/
+│       ├── audit.sql.go
+│       ├── db.go
+│       ├── models.go
+│       ├── querier.go
+│       ├── queries/
+│       │   └── audit.sql
+│       └── schema.sql
+├── internal_coverage_test.go
 ├── logger.go
 ├── logger_test.go
-├── memory/
-│   ├── memory.go
-│   └── memory_test.go
-├── mongostore/
-│   ├── mongostore.go
-│   └── mongostore_test.go
-└── postgres/
-    ├── postgres.go
-    └── postgres_test.go
+├── memory.go
+├── memory_test.go
+├── mongo.go
+├── mongo_test.go
+├── postgres.go
+├── postgres_test.go
+└── sqlc.yaml
 
-7 directories, 30 files
+6 directories, 38 files

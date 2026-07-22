@@ -12,7 +12,7 @@ linters:
     revive:
       rules:
         # AuditLog, Logger, and grevents.Bus are fixed interface shapes —
-        # test doubles (conformance's stubBus) and backend constructors
+        # test doubles (stubBus in events_test.go) and backend constructors
         # legitimately don't need every parameter, and dropping the name
         # would make call sites harder to read against the interface
         # they're implementing.
@@ -20,12 +20,13 @@ linters:
           disabled: true
   exclusions:
     rules:
-      # Test files use test-controlled inputs by design (conformance's
-      # concurrent-stress scenario, tamper hooks deliberately bypassing the
-      # API).
+      # Test files use test-controlled inputs by design (the shared
+      # contract suite's concurrent-stress scenario, tamper hooks
+      # deliberately bypassing the API). This also covers
+      # contract_audit_test.go and every per-backend *_test.go file now
+      # that the standalone conformance package has been folded into the
+      # root package's own tests.
       - path: _test\.go
-        linters: [gosec, errcheck, gocritic]
-      - path: conformance/conformance\.go
         linters: [gosec, errcheck, gocritic]
       - path: example/example\.go
         linters: [gosec, errcheck, gocritic]

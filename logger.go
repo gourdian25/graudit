@@ -4,35 +4,42 @@ package graudit
 
 // Logger is the minimal logging interface graudit backends accept for
 // optional diagnostic logging (constructor connectivity failures, grevents
-// publish failures, shutdown). It is satisfied structurally by
-// *grlog.Logger's printf-style methods (Infof/Warnf/Errorf) — graudit
-// itself does not import grlog, so plugging in a logger is entirely opt-in
-// and adds no dependency for consumers who don't want one.
+// publish failures, shutdown). Its four methods match *slog.Logger's own
+// signatures exactly, so *slog.Logger satisfies it structurally — graudit
+// itself does not import grlog or log/slog, so plugging in a logger is
+// entirely opt-in and adds no dependency for consumers who don't want one.
 //
 // A nil Logger passed to any backend's Config/Option is replaced with
 // NopLogger() — logging is always optional, never required for a backend
 // to function.
 //
-// Example:
+// Example, using grlog via its log/slog adapter (the recommended bridge —
+// grlog itself needs no code changes for this):
 //
-//	import "github.com/gourdian25/grlog"
+//	import (
+//		"log/slog"
 //
-//	logger := grlog.NewDefaultLogger()
-//	log, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+//		"github.com/gourdian25/grlog"
+//	)
+//
+//	logger := slog.New(grlog.NewSlogHandler(grlog.NewDefaultLogger()))
+//	log, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 //		DSN:    dsn,
-//		Logger: logger, // *grlog.Logger satisfies graudit.Logger directly
+//		Logger: logger, // *slog.Logger satisfies graudit.Logger directly
 //	})
 type Logger interface {
-	Infof(format string, args ...interface{})
-	Warnf(format string, args ...interface{})
-	Errorf(format string, args ...interface{})
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
+	Error(msg string, args ...any)
 }
 
 type noopLogger struct{}
 
-func (noopLogger) Infof(string, ...interface{})  {}
-func (noopLogger) Warnf(string, ...interface{})  {}
-func (noopLogger) Errorf(string, ...interface{}) {}
+func (noopLogger) Debug(string, ...any) {}
+func (noopLogger) Info(string, ...any)  {}
+func (noopLogger) Warn(string, ...any)  {}
+func (noopLogger) Error(string, ...any) {}
 
 // NopLogger returns a Logger that discards every message. It is the default
 // used by every backend when no Logger is configured.

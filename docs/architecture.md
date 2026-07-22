@@ -5,7 +5,39 @@ conventions and other decisions worth calling out explicitly — check here
 before "fixing" something that looks inconsistent with `grcache` or
 `gourdiantoken`.
 
-## No `SERIAL`/`BIGSERIAL` for `EntryID` in `graudit/postgres`
+## Package flattened into one, GORM replaced with pgx/v5 + sqlc
+
+graudit originally split each backend into its own importable subpackage
+(`graudit/memory`, `graudit/postgres`, `graudit/mongostore`), the same
+`grcache` originally did, to keep unused client libraries out of a
+consumer's build. That layout was reversed for consistency with the rest
+of the gourdian ecosystem's flat-package convention — every backend's
+constructor, Config/Option type, and concrete (unexported) implementation
+now live directly in `package graudit` (`memory.go`, `postgres.go`,
+`mongo.go`). Flattening incidentally resolved the `mongo` → `mongostore`
+rename-for-collision issue from `v0.2.0`: as a file within one flat
+package rather than a separate importable package, `mongo.go` no longer
+collides with `go.mongodb.org/mongo-driver/mongo`'s own package name, so
+the shorter, clearer name is safe again.
+
+Each backend's own concrete `AuditLog` implementation is unexported and
+backend-prefixed (`memoryAuditLog`, `postgresAuditLog`, `mongoAuditLog`) to
+avoid colliding with the shared, exported `AuditLog` interface in
+`audit.go` — before flattening, each subpackage could name its own struct
+plain `AuditLog` since it lived in a different Go package.
+
+The postgres backend's GORM implementation was replaced with `pgx/v5` and
+sqlc-generated queries (see `internal/postgresdb`), matching
+gourdiantoken's and grnoti's own Postgres backend pattern. This introduced
+a *second* Postgres advisory lock, `grauditSchemaLockKey`
+(`5_198_204_733`), used only to serialize schema application (`CREATE
+TABLE/INDEX IF NOT EXISTS`) across concurrent callers at connect time —
+deliberately distinct from `chainLockKey` (`892374651`), which continues
+to serialize the actual chain-append transaction as it always has. The two
+locks protect different things at different times and are never held
+simultaneously, so there's no reason to unify them into one key.
+
+## No `SERIAL`/`BIGSERIAL` for `EntryID` in the postgres backend
 
 `EntryID` is explicitly assigned by application code inside the same
 `pg_advisory_xact_lock`-held transaction that inserts the row, never a
@@ -18,11 +50,11 @@ what a hash chain exists to eliminate, so it can't be tolerated here even
 though it would be a completely normal, unremarkable choice in most other
 schemas.
 
-## `graudit/mongo` requires a replica set unconditionally
+## The mongo backend requires a replica set unconditionally
 
 Unlike `gourdiantoken`'s `NewMongoTokenRepository(db *mongo.Database,
 useTransactions bool)`, which makes transactions an opt-in escape hatch,
-`graudit/mongo`'s `NewMongoAuditLog` has no such flag. The chain's
+graudit's `NewMongoAuditLog` (`mongo.go`) has no such flag. The chain's
 correctness — not just its behavior under concurrent load — depends on the
 multi-document transaction that atomically updates both the new entry and
 the chain-state tail document. Running without a transaction would let two
@@ -43,18 +75,19 @@ mongos"` once a real read/write is attempted inside it. The fix inserts
 and deletes a throwaway document (under a reserved `_id`, distinct from
 the real `"tail"` chain-state document) inside the probe transaction, so
 the check is real but nothing persists either way. See
-`mongo/mongo_test.go`'s `TestNewMongoAuditLog_RequiresReplicaSet` — this
+`mongo_test.go`'s `TestNewMongoAuditLog_RequiresReplicaSet` — this
 test must never be reverted to `t.Skip`, since it is the only thing that
 catches a regression of this exact bug.
 
-## No TTL index in `graudit/mongo`
+## No TTL index in the mongo backend
 
-`grcache/mongo` uses a TTL index (`expireAfterSeconds: 0`) as its native
-expiry mechanism — caches are supposed to evict entries. `graudit/mongo`
-has no TTL index anywhere: audit entries are never expired. If a future
-retention/archival feature is added (see the plan doc's roadmap), it
-belongs in its own explicit sweep mechanism, not a database TTL index,
-since silent expiry is the opposite of what an audit trail should ever do.
+grcache's own Mongo backend uses a TTL index (`expireAfterSeconds: 0`) as
+its native expiry mechanism — caches are supposed to evict entries.
+graudit's mongo backend has no TTL index anywhere: audit entries are never
+expired. If a future retention/archival feature is added (see the plan
+doc's roadmap), it belongs in its own explicit sweep mechanism, not a
+database TTL index, since silent expiry is the opposite of what an audit
+trail should ever do.
 
 ## `grevents.Bus` is injected via Config/Option, not part of `AuditLog`
 
@@ -107,11 +140,13 @@ regression test.
 
 ## Constructor shape: `Config` struct for networked backends, `Option`s for memory
 
-Matches `grcache`'s actual split: `graudit/postgres` and `graudit/mongo`
-each take a single `<Backend>Config` struct (`New<Backend>AuditLog(cfg
-Config) (graudit.AuditLog, error)`); `graudit/memory` takes functional
-options (`NewMemoryAuditLog(opts ...Option)`), since it has no connection
-details to configure.
+Matches `grcache`'s own split: `NewPostgresAuditLog`/`NewMongoAuditLog`
+each take a single `<Backend>Config` struct
+(`New<Backend>AuditLog(cfg Config) (AuditLog, error)`); `NewMemoryAuditLog`
+takes functional options (`NewMemoryAuditLog(opts ...MemoryOption)`,
+renamed from the pre-flatten `Option` to avoid an overly generic
+root-package-level name now that all three backends share one package),
+since it has no connection details to configure.
 
 ## No Redis/memcached backend
 
@@ -119,8 +154,23 @@ The original plan doc's own reasoning for excluding cache-backed storage
 ("an audit trail in a cache that can evict entries is a contradiction")
 still holds for Redis/memcached specifically — those are genuinely cache
 technologies with eviction as a first-class feature. MongoDB was added to
-the backend list by explicit user decision despite `grcache/mongo` also
-being a cache backend, because `graudit/mongo` deliberately configures no
-TTL index and no eviction path (see above) — it uses MongoDB purely as a
-durable document store, sidestepping the contradiction that disqualified
-Redis/memcached.
+the backend list by explicit user decision despite grcache's own Mongo
+backend also being a cache, because graudit's mongo backend deliberately
+configures no TTL index and no eviction path (see above) — it uses
+MongoDB purely as a durable document store, sidestepping the contradiction
+that disqualified Redis/memcached.
+
+## `Verify()`'s Check B has its own dedicated regression test
+
+The shared contract suite's `VerifyDetectsTamper` scenario (in
+`contract_audit_test.go`) only ever corrupts a stored entry's `Payload`
+via each backend's `tamperHookFunc` — which changes the entry's
+*recomputed* hash and so only ever exercises Check A (per-entry hash
+integrity). Check B (chain linkage: each entry's stored `PrevHash` must
+equal the immediately preceding entry's stored `Hash`) was, until an
+internal coverage audit caught it, completely untested on every backend.
+Each backend now has its own
+`Test<Backend>AuditLog_VerifyDetectsChainLinkageBreak` test in
+`internal_coverage_test.go`, directly corrupting a stored entry's
+`PrevHash` (bypassing `Payload` entirely) and asserting `Verify` reports
+the break at the correct `EntryID`.

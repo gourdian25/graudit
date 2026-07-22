@@ -33,6 +33,18 @@ func (b *stubBus) Use(mw grevents.Middleware)                       {}
 func (b *stubBus) Stats(ctx context.Context) (grevents.Stats, error) { return grevents.Stats{}, nil }
 func (b *stubBus) Close() error                                     { return nil }
 
+func (b *stubBus) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.published)
+}
+
+func (b *stubBus) last() grevents.Event {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.published[len(b.published)-1]
+}
+
 var _ grevents.Bus = (*stubBus)(nil)
 
 func TestPublishRecorded_NilBusIsNoOp(t *testing.T) {

@@ -18,13 +18,19 @@ together:
 - [grlog](https://github.com/gourdian25/grlog) — zero-dependency structured
   logging; graudit's optional `Logger` interface is satisfied by it directly.
 - [grcache](https://github.com/gourdian25/grcache) — backend-agnostic
-  caching abstraction, mirroring graudit's own subpackage-per-backend layout.
+  caching abstraction, the same interface-plus-multiple-backends pattern
+  graudit uses, both flattened into a single package.
 - [grevents](https://github.com/gourdian25/grevents) — an in-process event
   bus; graudit publishes an `"audit.recorded"` event through it on every
   successful write (see below).
 - [grpolicy](https://github.com/gourdian25/grpolicy) — attribute-based
   policy evaluation (RBAC/ABAC), independent of any notion of "user" or
   "role".
+- [grnoti](https://github.com/gourdian25/grnoti) — a push-notification
+  service (FCM dispatch, idempotent event processing, device-token
+  management, DLQ retry, circuit breaking, distributed rate limiting,
+  deterministic A/B experiment assignment, localization, topic-based
+  routing).
 
 ## The precise claim (read this before trusting `Verify()`)
 
@@ -51,11 +57,10 @@ import (
 	"log"
 
 	"github.com/gourdian25/graudit"
-	"github.com/gourdian25/graudit/memory"
 )
 
 func main() {
-	auditLog, err := memory.NewMemoryAuditLog()
+	auditLog, err := graudit.NewMemoryAuditLog()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -80,30 +85,69 @@ See [example/example.go](example/example.go) for a fuller runnable demo
 
 ## Backends
 
-Each backend lives in its own importable subpackage so consumers who only
-need one backend don't pull in the others' client libraries.
+graudit is a flat, single package — every backend's constructor and
+Config/Option type live directly in `github.com/gourdian25/graudit`, no
+subpackages to import selectively. See
+[docs/architecture.md](docs/architecture.md) for the full rationale and
+each backend's serialization strategy in detail.
 
-| Backend | Package | Use case | Serialization |
+| Backend | Constructor | Use case | Serialization |
 |---|---|---|---|
-| In-memory | `graudit/memory` | Test/dev only — never for anything you need to keep | `sync.Mutex` |
-| PostgreSQL | `graudit/postgres` | Production | `pg_advisory_xact_lock` + explicitly-assigned `EntryID` |
-| MongoDB | `graudit/mongostore` | Production (requires a replica set) | Multi-document ACID transaction |
+| In-memory | `NewMemoryAuditLog` | Test/dev only — never for anything you need to keep | `sync.Mutex` |
+| PostgreSQL | `NewPostgresAuditLog` | Production | `pg_advisory_xact_lock` + explicitly-assigned `EntryID` |
+| MongoDB | `NewMongoAuditLog` | Production (requires a replica set) | Multi-document ACID transaction |
 
 ```go
-// Postgres
-import "github.com/gourdian25/graudit/postgres"
-auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+// Postgres — pgx/v5 with sqlc-generated queries, no ORM.
+auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	DSN: "host=localhost user=myuser password=mypass dbname=mydb port=5432 sslmode=disable",
 })
 
 // MongoDB — must be a replica set (single-node is sufficient); construction
 // fails fast otherwise, wrapping graudit.ErrReplicaSetRequired.
-import "github.com/gourdian25/graudit/mongostore"
-auditLog, err := mongostore.NewMongoAuditLog(mongostore.MongoConfig{
+auditLog, err := graudit.NewMongoAuditLog(graudit.MongoConfig{
 	URI:      "mongodb://localhost:27017/?replicaSet=rs0",
 	Database: "myapp",
 })
 ```
+
+### Why this shape
+
+graudit used to split Postgres/Mongo/memory into separate importable
+subpackages and used GORM for its Postgres backend. Both changed as part
+of an ecosystem-wide standardization pass: the backends flattened into
+this one root package, and GORM was replaced with `pgx/v5` +
+sqlc-generated queries. See [CHANGELOG.md](CHANGELOG.md)'s `[Unreleased]`
+entry for the full rationale.
+
+## Thread safety
+
+Every backend's `AuditLog` is safe for concurrent use by multiple
+goroutines:
+
+- **In-memory** — a single `sync.Mutex` guards the entry slice, the last
+  hash, and the last entry ID together; the same lock doubles as the
+  chain's single-writer serialization point, so concurrent `Record` calls
+  append in a strictly ordered, non-overlapping sequence.
+- **PostgreSQL** — backed by a `pgxpool.Pool`, which pgx itself guarantees
+  is safe for concurrent use; chain serialization is a
+  `pg_advisory_xact_lock` held for the duration of the transaction, so
+  ordering is enforced by Postgres itself, not by a Go-level mutex.
+- **MongoDB** — backed by a `*mongo.Client`, which the driver itself
+  guarantees is safe for concurrent use; chain serialization is a
+  multi-document ACID transaction (`session.WithTransaction`), enforced by
+  MongoDB itself, not by a Go-level mutex.
+
+All three backends additionally guard their closed state with an
+`atomic.Bool` and make `Close()` idempotent via `sync.Once`, so calling
+`Close()` concurrently with in-flight `Record`/`RecordChange`/`Verify`/
+`Query` calls is safe — in-flight calls either complete normally or observe
+`ErrClosed`.
+
+None of this is optional to verify: `make race` (`go test -race ./...`) is
+mandatory before any change touching the hash-chain or serialization code,
+and is how the contract suite's `ConcurrentRecordStress` scenario is
+actually exercised — see [Testing](#testing) below.
 
 ## grevents integration
 
@@ -120,7 +164,7 @@ channel on top of it.
 import "github.com/gourdian25/grevents"
 
 bus, _ := grevents.NewBus()
-auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	DSN:      dsn,
 	EventBus: bus,
 })
@@ -128,25 +172,32 @@ auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
 
 ## Logger
 
-Every backend accepts an optional `graudit.Logger` (`Infof`/`Warnf`/`Errorf`)
-for diagnostic messages — connection failures, grevents publish failures,
-shutdown. A `nil` Logger (the default) means graudit logs nothing.
-[`*grlog.Logger`](https://github.com/gourdian25/grlog) satisfies this
-interface with no adapter, the same pattern grcache uses — see
-`logger_test.go`'s `TestGrlogSatisfiesLoggerInterface` for the compile+run
-proof, and [example/example.go](example/example.go) for a runnable demo.
+Every backend accepts an optional `graudit.Logger`
+(`Debug`/`Info`/`Warn`/`Error(msg string, args ...any)`, matching
+`*slog.Logger`'s own signatures) for diagnostic messages — connection
+failures, grevents publish failures, shutdown. A `nil` Logger (the default)
+means graudit logs nothing. Any slog-based logger, including one backed by
+grlog via [`slog.New(grlog.NewSlogHandler(...))`](https://github.com/gourdian25/grlog),
+satisfies this interface with no adapter, the same pattern grcache uses —
+see `logger_test.go`'s `TestGrlogSatisfiesLoggerInterface` for the
+compile+run proof, and [example/example.go](example/example.go) for a
+runnable demo.
 
 ```go
-import "github.com/gourdian25/grlog"
+import (
+	"log/slog"
 
-logger := grlog.NewDefaultLogger()
-auditLog, err := postgres.NewPostgresAuditLog(postgres.PostgresConfig{
+	"github.com/gourdian25/grlog"
+)
+
+logger := slog.New(grlog.NewSlogHandler(grlog.NewDefaultLogger()))
+auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	DSN:    dsn,
-	Logger: logger, // *grlog.Logger satisfies graudit.Logger directly
+	Logger: logger, // *slog.Logger satisfies graudit.Logger directly
 })
 
-// memory takes an Option instead of a Config field:
-auditLog, err := memory.NewMemoryAuditLog(memory.WithLogger(logger))
+// memory takes MemoryOption functional options instead of a Config field:
+auditLog, err := graudit.NewMemoryAuditLog(graudit.WithLogger(logger))
 ```
 
 ## `Verify()` semantics
@@ -170,46 +221,49 @@ one recomputed from its own stored fields, and that each entry's stored
 ## Testing
 
 graudit's own tests run against real local Postgres/MongoDB instances — no
-mocks — mirroring the ecosystem's testing philosophy.
+mocks — mirroring the ecosystem's testing philosophy. These are the same
+shared containers grnoti, grcache, and gourdiantoken test against (each
+repo gets its own database) — start them with:
 
 ```sh
-docker run -d --name graudit-postgres -p 5432:5432 \
-  -e POSTGRES_USER=postgres_user -e POSTGRES_PASSWORD=postgres_password postgres:16
-createdb -U postgres_user -h localhost graudit_test
-
-# No auth env vars: MONGO_INITDB_ROOT_USERNAME/PASSWORD enables auth, which
-# requires a keyFile once --replSet is also set ("security.keyFile is
-# required when authorization is enabled with replica sets") — unnecessary
-# complexity for a local test replica set, so this container runs without
-# auth.
-docker run -d --name graudit-mongo -p 27018:27017 mongo:7 --replSet rs0
-docker exec graudit-mongo mongosh --eval 'rs.initiate()'
-
-# A second, genuinely standalone (no --replSet) instance, required by
-# TestNewMongoAuditLog_RequiresReplicaSet — the one test that actually
-# proves construction fails fast against a non-replica-set deployment
-# (see mongo/mongo_test.go's comment for why this test must never be
-# skipped: an earlier version of this exact test caught a real bug where
-# the fail-fast check silently passed against a standalone instance).
-docker run -d --name graudit-mongo-standalone -p 27019:27017 mongo:7
+make docker-up   # starts the shared Postgres/Mongo(auth)/Mongo(standalone) test containers
+make docker-down # stops them when you're done
 ```
 
-The Mongo backend additionally requires the instance to be configured as a
-replica set (single-node is sufficient) — construction fails fast against
-a standalone instance.
+The root package maintains 95.2% test coverage, enforced by a 95% gate
+(`make coverage-check`).
+
+The primary Mongo container is an authenticated single-node replica set —
+the workspace-wide standard. A second, genuinely standalone (no `--replSet`,
+no auth) instance is also started, required by
+`TestNewMongoAuditLog_RequiresReplicaSet` — the one test that actually
+proves construction fails fast against a non-replica-set deployment (see
+`mongo_test.go`'s comment for why this test must never be skipped: an
+earlier version of this exact test caught a real bug where the fail-fast
+check silently passed against a standalone instance).
 
 ```sh
-make test             # go test -cover ./...
-make race             # go test -race ./...  (mandatory before any commit touching the hash-chain or serialization code)
-make coverage-check   # verify every package independently meets 80% coverage
-make bench            # go test -bench=. -benchmem -benchtime=10s ./...
+make fmt              # gofmt
+make vet              # go vet ./...
 make lint             # golangci-lint run ./...
+make test              # go test -cover ./...
+make race               # go test -race ./...  (mandatory before any change touching the hash-chain or serialization code)
+make coverage-check       # verify the root package meets 95%
 ```
 
-A shared `conformance` package runs one behavioral suite (hash-chain
-integrity, concurrent-write ordering, deliberate-tamper detection, hash
-determinism, grevents publish/publish-failure) against all three backends
-through the `AuditLog` interface.
+`make bench` (`go test -bench=. -benchmem -benchtime=10s ./...`) is also
+defined in the Makefile, but there are currently no `Benchmark*` functions
+anywhere in this repo — running it builds and passes without executing any
+benchmark or producing timing numbers. Treat it as reserved for when
+microbenchmarks are added, not as a working target today.
+
+A shared contract test suite (`contract_audit_test.go`, run via
+`TestAuditLog_Contract`'s per-backend subtests) runs one behavioral suite
+(hash-chain integrity, concurrent-write ordering, deliberate-tamper
+detection, hash determinism, grevents publish/publish-failure) against all
+three backends through the `AuditLog` interface — folded from a standalone
+`conformance` package into the root package's own tests, matching the rest
+of the gourdian ecosystem's convention.
 
 ## Out of scope (v1)
 
@@ -222,6 +276,25 @@ sweeping of old entries. See
 [docs/plan/graudit-plan.md](docs/plan/graudit-plan.md) for the full
 roadmap.
 
+## Contributing
+
+1. Fork the repository and create a feature branch off `master`.
+2. Make your change, following the conventions in [CLAUDE.md](CLAUDE.md) —
+   the `// File: <path>` header on every source file (maintained by the
+   `bark` tool), exhaustive doc comments on exported symbols, sentinel
+   errors defined once in `errors.go`, `Close()` idempotency, and so on.
+3. Run the full test suite and lint locally — see [Testing](#testing)
+   above for the exact commands — before opening a pull request. Any
+   change touching the hash-chain or serialization code must pass
+   `make race`.
+4. Open a pull request describing what changed and why.
+
+See [CLAUDE.md](CLAUDE.md) for the full architecture rundown.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+See [CHANGELOG.md](CHANGELOG.md) for release history and
+[SECURITY.md](SECURITY.md) to report a vulnerability privately instead of
+opening a public issue.

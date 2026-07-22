@@ -25,9 +25,9 @@ var GenesisPrevHash = strings.Repeat("0", 64)
 type EntryID uint64
 
 // AuditLog is the primary interface all backends implement. Every backend
-// subpackage (graudit/memory, graudit/postgres, graudit/mongo) provides a
-// constructor returning an AuditLog, so application code can depend on this
-// interface alone and swap backends without changing call sites.
+// file (memory.go, postgres.go, mongo.go) provides a constructor returning
+// an AuditLog, so application code can depend on this interface alone and
+// swap backends without changing call sites.
 type AuditLog interface {
 	// Record computes the entry's hash (its own fields plus the previous
 	// entry's hash), appends it durably, and publishes a
@@ -146,9 +146,9 @@ type AuditEvent struct {
 // Validate checks that e has the minimum fields required to be recorded and
 // that Payload can be JSON-marshaled at all. Every backend calls this once,
 // at the top of Record, before doing anything durable — exported (not just
-// an unexported helper) specifically because backends live in separate
-// subpackages (graudit/postgres, graudit/memory, graudit/mongo) and must
-// all apply identical validation.
+// an unexported helper) so that every backend (memory.go, postgres.go,
+// mongo.go) applies identical validation despite each implementing Record
+// independently.
 func (e AuditEvent) Validate() error {
 	switch {
 	case e.ActorID == "":
