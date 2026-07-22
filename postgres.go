@@ -118,13 +118,13 @@ var _ AuditLog = (*postgresAuditLog)(nil)
 //	})
 func NewPostgresAuditLog(cfg PostgresConfig) (AuditLog, error) {
 	if cfg.DSN == "" {
-		return nil, fmt.Errorf("graudit/postgres: PostgresConfig.DSN is required")
+		return nil, fmt.Errorf("graudit: PostgresConfig.DSN is required")
 	}
 	appLogger := OrNop(cfg.Logger)
 
 	poolCfg, err := pgxpool.ParseConfig(cfg.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("graudit/postgres: parse dsn: %w", ErrBackendUnavailable)
+		return nil, fmt.Errorf("graudit: parse dsn: %w", ErrBackendUnavailable)
 	}
 	if cfg.MaxConns > 0 {
 		poolCfg.MaxConns = cfg.MaxConns
@@ -141,22 +141,22 @@ func NewPostgresAuditLog(cfg PostgresConfig) (AuditLog, error) {
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		appLogger.Errorf("graudit/postgres: open failed: %v", err)
-		return nil, fmt.Errorf("graudit/postgres: open: %w", ErrBackendUnavailable)
+		appLogger.Errorf("graudit: open failed: %v", err)
+		return nil, fmt.Errorf("graudit: open: %w", ErrBackendUnavailable)
 	}
 
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		appLogger.Errorf("graudit/postgres: ping failed: %v", err)
-		return nil, fmt.Errorf("graudit/postgres: ping: %w", ErrBackendUnavailable)
+		appLogger.Errorf("graudit: ping failed: %v", err)
+		return nil, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
 	}
 
 	if err := applyPostgresSchema(ctx, pool); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("graudit/postgres: apply schema: %w", err)
+		return nil, fmt.Errorf("graudit: apply schema: %w", err)
 	}
 
-	appLogger.Infof("graudit/postgres: connected")
+	appLogger.Infof("graudit: connected")
 	return &postgresAuditLog{pool: pool, q: postgresdb.New(pool), logger: appLogger, bus: cfg.EventBus}, nil
 }
 
@@ -230,7 +230,7 @@ func (a *postgresAuditLog) Record(ctx context.Context, event AuditEvent) (EntryI
 		return 0, ErrClosed
 	}
 	if err := event.Validate(); err != nil {
-		return 0, fmt.Errorf("graudit/postgres: record: %w", err)
+		return 0, fmt.Errorf("graudit: record: %w", err)
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
@@ -238,7 +238,7 @@ func (a *postgresAuditLog) Record(ctx context.Context, event AuditEvent) (EntryI
 
 	payloadBytes, err := marshalPayload(event.Payload)
 	if err != nil {
-		return 0, fmt.Errorf("graudit/postgres: record: %w", err)
+		return 0, fmt.Errorf("graudit: record: %w", err)
 	}
 
 	var recorded AuditEvent
@@ -281,7 +281,7 @@ func (a *postgresAuditLog) Record(ctx context.Context, event AuditEvent) (EntryI
 		return nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("graudit/postgres: record: %w", ErrBackendUnavailable)
+		return 0, fmt.Errorf("graudit: record: %w", ErrBackendUnavailable)
 	}
 
 	PublishRecorded(ctx, a.bus, a.logger, recorded)
@@ -293,7 +293,7 @@ func (a *postgresAuditLog) Record(ctx context.Context, event AuditEvent) (EntryI
 func (a *postgresAuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error) {
 	event, err := BuildChangeEvent(actorID, entityType, entityID, before, after)
 	if err != nil {
-		return 0, fmt.Errorf("graudit/postgres: record change: %w", err)
+		return 0, fmt.Errorf("graudit: record change: %w", err)
 	}
 	return a.Record(ctx, event)
 }
@@ -314,7 +314,7 @@ func (a *postgresAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, 
 
 	rows, err := a.q.ListEntriesInRange(ctx, postgresdb.ListEntriesInRangeParams{FromID: toPgEntryID(from), ToID: toPgEntryID(to)})
 	if err != nil {
-		return false, VerifyResult{}, fmt.Errorf("graudit/postgres: verify: %w", ErrBackendUnavailable)
+		return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", ErrBackendUnavailable)
 	}
 
 	var prevHash string
@@ -331,11 +331,11 @@ func (a *postgresAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, 
 
 		payload, err := DecodeStoredPayload(row.Payload)
 		if err != nil {
-			return false, VerifyResult{}, fmt.Errorf("graudit/postgres: verify: %w", err)
+			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
 		recomputed, err := ComputeHash(pgEntryID(row.EntryID), row.ActorID, row.EntityType, row.EntityID, row.Action, payload, row.Timestamp.Time, row.PrevHash)
 		if err != nil {
-			return false, VerifyResult{}, fmt.Errorf("graudit/postgres: verify: %w", err)
+			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
 		if recomputed != row.Hash {
 			return false, VerifyResult{
@@ -377,14 +377,14 @@ func (a *postgresAuditLog) Query(ctx context.Context, filter QueryFilter) ([]Aud
 
 	rows, err := a.q.QueryEntries(ctx, params)
 	if err != nil {
-		return nil, fmt.Errorf("graudit/postgres: query: %w", ErrBackendUnavailable)
+		return nil, fmt.Errorf("graudit: query: %w", ErrBackendUnavailable)
 	}
 
 	out := make([]AuditEvent, 0, len(rows))
 	for _, row := range rows {
 		event, err := postgresEntryToAuditEvent(row)
 		if err != nil {
-			return nil, fmt.Errorf("graudit/postgres: query: %w", err)
+			return nil, fmt.Errorf("graudit: query: %w", err)
 		}
 		out = append(out, event)
 	}
@@ -396,7 +396,7 @@ func (a *postgresAuditLog) Close() error {
 	a.closeOnce.Do(func() {
 		a.closed.Store(true)
 		a.pool.Close()
-		a.logger.Infof("graudit/postgres: audit log closed")
+		a.logger.Infof("graudit: audit log closed")
 	})
 	return nil
 }

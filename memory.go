@@ -89,7 +89,7 @@ func (a *memoryAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID,
 		return 0, ErrClosed
 	}
 	if err := event.Validate(); err != nil {
-		return 0, fmt.Errorf("graudit/memory: record: %w", err)
+		return 0, fmt.Errorf("graudit: record: %w", err)
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
@@ -106,7 +106,7 @@ func (a *memoryAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID,
 	hash, err := ComputeHash(nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
 	if err != nil {
 		a.mu.Unlock()
-		return 0, fmt.Errorf("graudit/memory: record: %w", err)
+		return 0, fmt.Errorf("graudit: record: %w", err)
 	}
 
 	event.ID = nextID
@@ -128,7 +128,7 @@ func (a *memoryAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID,
 func (a *memoryAuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error) {
 	event, err := BuildChangeEvent(actorID, entityType, entityID, before, after)
 	if err != nil {
-		return 0, fmt.Errorf("graudit/memory: record change: %w", err)
+		return 0, fmt.Errorf("graudit: record change: %w", err)
 	}
 	return a.Record(ctx, event)
 }
@@ -178,7 +178,7 @@ func verifyMemoryChain(entries []AuditEvent) (bool, VerifyResult, error) {
 
 		recomputed, err := ComputeHash(e.ID, e.ActorID, e.EntityType, e.EntityID, e.Action, e.Payload, e.Timestamp, e.PrevHash)
 		if err != nil {
-			return false, VerifyResult{}, fmt.Errorf("graudit/memory: verify: %w", err)
+			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
 		if recomputed != e.Hash {
 			return false, VerifyResult{

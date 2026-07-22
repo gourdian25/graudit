@@ -26,6 +26,11 @@ together:
 - [grpolicy](https://github.com/gourdian25/grpolicy) — attribute-based
   policy evaluation (RBAC/ABAC), independent of any notion of "user" or
   "role".
+- [grnoti](https://github.com/gourdian25/grnoti) — a push-notification
+  service (FCM dispatch, idempotent event processing, device-token
+  management, DLQ retry, circuit breaking, distributed rate limiting,
+  deterministic A/B experiment assignment, localization, topic-based
+  routing).
 
 ## The precise claim (read this before trusting `Verify()`)
 
@@ -82,7 +87,9 @@ See [example/example.go](example/example.go) for a fuller runnable demo
 
 graudit is a flat, single package — every backend's constructor and
 Config/Option type live directly in `github.com/gourdian25/graudit`, no
-subpackages to import selectively.
+subpackages to import selectively. See
+[docs/architecture.md](docs/architecture.md) for the full rationale and
+each backend's serialization strategy in detail.
 
 | Backend | Constructor | Use case | Serialization |
 |---|---|---|---|
@@ -112,6 +119,35 @@ of an ecosystem-wide standardization pass: the backends flattened into
 this one root package, and GORM was replaced with `pgx/v5` +
 sqlc-generated queries. See [CHANGELOG.md](CHANGELOG.md)'s `[Unreleased]`
 entry for the full rationale.
+
+## Thread safety
+
+Every backend's `AuditLog` is safe for concurrent use by multiple
+goroutines:
+
+- **In-memory** — a single `sync.Mutex` guards the entry slice, the last
+  hash, and the last entry ID together; the same lock doubles as the
+  chain's single-writer serialization point, so concurrent `Record` calls
+  append in a strictly ordered, non-overlapping sequence.
+- **PostgreSQL** — backed by a `pgxpool.Pool`, which pgx itself guarantees
+  is safe for concurrent use; chain serialization is a
+  `pg_advisory_xact_lock` held for the duration of the transaction, so
+  ordering is enforced by Postgres itself, not by a Go-level mutex.
+- **MongoDB** — backed by a `*mongo.Client`, which the driver itself
+  guarantees is safe for concurrent use; chain serialization is a
+  multi-document ACID transaction (`session.WithTransaction`), enforced by
+  MongoDB itself, not by a Go-level mutex.
+
+All three backends additionally guard their closed state with an
+`atomic.Bool` and make `Close()` idempotent via `sync.Once`, so calling
+`Close()` concurrently with in-flight `Record`/`RecordChange`/`Verify`/
+`Query` calls is safe — in-flight calls either complete normally or observe
+`ErrClosed`.
+
+None of this is optional to verify: `make race` (`go test -race ./...`) is
+mandatory before any change touching the hash-chain or serialization code,
+and is how the contract suite's `ConcurrentRecordStress` scenario is
+actually exercised — see [Testing](#testing) below.
 
 ## grevents integration
 
@@ -199,17 +235,20 @@ proves construction fails fast against a non-replica-set deployment (see
 earlier version of this exact test caught a real bug where the fail-fast
 check silently passed against a standalone instance).
 
-The Mongo backend additionally requires the instance to be configured as a
-replica set (single-node is sufficient) — construction fails fast against
-a standalone instance.
-
 ```sh
-make test             # go test -cover ./...
-make race             # go test -race ./...  (mandatory before any commit touching the hash-chain or serialization code)
-make coverage-check   # verify the root package meets 95% coverage
-make bench            # go test -bench=. -benchmem -benchtime=10s ./...
+make fmt              # gofmt
+make vet              # go vet ./...
 make lint             # golangci-lint run ./...
+make test              # go test -cover ./...
+make race               # go test -race ./...  (mandatory before any change touching the hash-chain or serialization code)
+make coverage-check       # verify the root package meets 95%
 ```
+
+`make bench` (`go test -bench=. -benchmem -benchtime=10s ./...`) is also
+defined in the Makefile, but there are currently no `Benchmark*` functions
+anywhere in this repo — running it builds and passes without executing any
+benchmark or producing timing numbers. Treat it as reserved for when
+microbenchmarks are added, not as a working target today.
 
 A shared contract test suite (`contract_audit_test.go`, run via
 `TestAuditLog_Contract`'s per-backend subtests) runs one behavioral suite
@@ -232,14 +271,16 @@ roadmap.
 
 ## Contributing
 
-```sh
-make fmt              # gofmt
-make vet              # go vet
-make lint              # golangci-lint (if installed)
-make test               # go test -cover ./...
-make race                # go test -race ./...  — mandatory before any PR touching the hash-chain or serialization code
-make coverage-check        # the root package must meet 95%
-```
+1. Fork the repository and create a feature branch off `master`.
+2. Make your change, following the conventions in [CLAUDE.md](CLAUDE.md) —
+   the `// File: <path>` header on every source file (maintained by the
+   `bark` tool), exhaustive doc comments on exported symbols, sentinel
+   errors defined once in `errors.go`, `Close()` idempotency, and so on.
+3. Run the full test suite and lint locally — see [Testing](#testing)
+   above for the exact commands — before opening a pull request. Any
+   change touching the hash-chain or serialization code must pass
+   `make race`.
+4. Open a pull request describing what changed and why.
 
 See [CLAUDE.md](CLAUDE.md) for the full architecture rundown.
 

@@ -3,7 +3,7 @@
 // Package graudit provides an append-only, tamper-evident audit trail for
 // the gourdian ecosystem.
 //
-// Overview:
+// # Overview
 //
 // graudit answers "what changed, who did it, and can we prove the record
 // hasn't been altered" — a different question from what grlog answers
@@ -11,7 +11,7 @@
 // could contribute to SOC2/HIPAA/PCI readiness, not a compliance
 // certification product itself.
 //
-// The Precise Claim (read this before trusting Verify()):
+// # The Precise Claim (read this before trusting Verify())
 //
 // Hash-chaining proves internal consistency: nothing in the recorded range
 // was altered or removed without Verify() detecting it. It does NOT prove
@@ -22,7 +22,8 @@
 // controls the storage. Do not let "tamper-evident" read as
 // "cryptographically un-forgeable" anywhere this package is described.
 //
-// Key Features:
+// # Key Features
+//
 //   - A single AuditLog interface: Record, RecordChange, Verify, Query,
 //     Close — implemented identically by all three backends
 //   - Hash-chained entries: each entry's Hash covers its own fields plus
@@ -41,7 +42,7 @@
 //     TestGrlogSatisfiesLoggerInterface, mirroring grcache's own
 //     logger_test.go)
 //
-// Getting Started:
+// # Getting Started
 //
 //	import (
 //		"context"
@@ -70,7 +71,7 @@
 //		log.Println("recorded entry", id)
 //	}
 //
-// Backends:
+// # Backends
 //
 // graudit is a flat, single package — every backend's constructor and
 // Config/Option type live directly in the graudit package (no subpackages
@@ -111,7 +112,7 @@
 //
 //     log_, err := graudit.NewMongoAuditLog(graudit.MongoConfig{URI: uri, Database: "myapp"})
 //
-// grevents Integration:
+// # grevents Integration
 //
 // Every backend accepts an optional grevents.Bus (via its Config/Option),
 // defaulting to nil — no bus configured means Record simply doesn't
@@ -128,7 +129,7 @@
 //		EventBus: bus,
 //	})
 //
-// Error Handling:
+// # Error Handling
 //
 //	id, err := log_.Record(ctx, event)
 //	if errors.Is(err, graudit.ErrInvalidEvent) {
@@ -137,7 +138,7 @@
 //		// backend unavailable or another real failure
 //	}
 //
-// Verify() Semantics:
+// # Verify() Semantics
 //
 //	ok, detail, err := log_.Verify(ctx, 1, latestID)
 //	if err != nil {
@@ -148,7 +149,7 @@
 //			detail.BrokenAt, detail.Expected, detail.Actual)
 //	}
 //
-// Testing:
+// # Testing
 //
 // graudit's own tests run against real local Postgres/MongoDB instances —
 // no mocks — mirroring the ecosystem's testing philosophy. The Mongo
@@ -161,7 +162,7 @@
 // through the AuditLog interface — folded from a standalone conformance
 // package into the root package's own tests for ecosystem consistency.
 //
-// Out of Scope (v1):
+// # Out of Scope (v1)
 //
 // Full SOC2/HIPAA/PCI/ISO certification tooling, real-time alerting (a
 // consumer's job, reacting to TopicAuditRecorded), auto-instrumentation

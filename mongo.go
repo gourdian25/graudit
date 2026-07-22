@@ -52,7 +52,7 @@ import (
 
 const (
 	defaultCollection = "graudit_entries"
-	chainStateID       = "tail"
+	chainStateID      = "tail"
 )
 
 // entryDocument is the BSON document shape for a single chain entry.
@@ -151,10 +151,10 @@ var _ AuditLog = (*mongoAuditLog)(nil)
 //	log, err := graudit.NewMongoAuditLog(graudit.MongoConfig{URI: uri, Database: "myapp"})
 func NewMongoAuditLog(cfg MongoConfig) (AuditLog, error) {
 	if cfg.URI == "" {
-		return nil, fmt.Errorf("graudit/mongo: MongoConfig.URI is required")
+		return nil, fmt.Errorf("graudit: MongoConfig.URI is required")
 	}
 	if cfg.Database == "" {
-		return nil, fmt.Errorf("graudit/mongo: MongoConfig.Database is required")
+		return nil, fmt.Errorf("graudit: MongoConfig.Database is required")
 	}
 	cfg = cfg.withDefaults()
 	appLogger := OrNop(cfg.Logger)
@@ -164,14 +164,14 @@ func NewMongoAuditLog(cfg MongoConfig) (AuditLog, error) {
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(cfg.URI))
 	if err != nil {
-		appLogger.Errorf("graudit/mongo: connect failed: %v", err)
-		return nil, fmt.Errorf("graudit/mongo: connect: %w", ErrBackendUnavailable)
+		appLogger.Errorf("graudit: connect failed: %v", err)
+		return nil, fmt.Errorf("graudit: connect: %w", ErrBackendUnavailable)
 	}
 
 	if err := client.Ping(ctx, readpref.Primary()); err != nil {
 		_ = client.Disconnect(ctx)
-		appLogger.Errorf("graudit/mongo: ping failed: %v", err)
-		return nil, fmt.Errorf("graudit/mongo: ping: %w", ErrBackendUnavailable)
+		appLogger.Errorf("graudit: ping failed: %v", err)
+		return nil, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
 	}
 
 	db := client.Database(cfg.Database)
@@ -180,16 +180,16 @@ func NewMongoAuditLog(cfg MongoConfig) (AuditLog, error) {
 
 	if err := probeTransactionSupport(ctx, client, chainColl); err != nil {
 		_ = client.Disconnect(ctx)
-		appLogger.Errorf("graudit/mongo: transaction probe failed: %v", err)
-		return nil, fmt.Errorf("graudit/mongo: %w", ErrReplicaSetRequired)
+		appLogger.Errorf("graudit: transaction probe failed: %v", err)
+		return nil, fmt.Errorf("graudit: %w", ErrReplicaSetRequired)
 	}
 
 	if err := ensureAuditIndexes(ctx, entries); err != nil {
 		_ = client.Disconnect(ctx)
-		return nil, fmt.Errorf("graudit/mongo: ensure indexes: %w", err)
+		return nil, fmt.Errorf("graudit: ensure indexes: %w", err)
 	}
 
-	appLogger.Infof("graudit/mongo: connected to database %q collection %q", cfg.Database, cfg.Collection)
+	appLogger.Infof("graudit: connected to database %q collection %q", cfg.Database, cfg.Collection)
 	return &mongoAuditLog{client: client, entries: entries, chainColl: chainColl, logger: appLogger, bus: cfg.EventBus}, nil
 }
 
@@ -247,7 +247,7 @@ func (a *mongoAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID, 
 		return 0, ErrClosed
 	}
 	if err := event.Validate(); err != nil {
-		return 0, fmt.Errorf("graudit/mongo: record: %w", err)
+		return 0, fmt.Errorf("graudit: record: %w", err)
 	}
 	if event.Timestamp.IsZero() {
 		event.Timestamp = time.Now().UTC()
@@ -255,12 +255,12 @@ func (a *mongoAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID, 
 
 	payloadBytes, err := marshalPayload(event.Payload)
 	if err != nil {
-		return 0, fmt.Errorf("graudit/mongo: record: %w", err)
+		return 0, fmt.Errorf("graudit: record: %w", err)
 	}
 
 	session, err := a.client.StartSession()
 	if err != nil {
-		return 0, fmt.Errorf("graudit/mongo: record: %w", ErrBackendUnavailable)
+		return 0, fmt.Errorf("graudit: record: %w", ErrBackendUnavailable)
 	}
 	defer session.EndSession(ctx)
 
@@ -306,7 +306,7 @@ func (a *mongoAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID, 
 		return nil, nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("graudit/mongo: record: %w", ErrBackendUnavailable)
+		return 0, fmt.Errorf("graudit: record: %w", ErrBackendUnavailable)
 	}
 
 	PublishRecorded(ctx, a.bus, a.logger, recorded)
@@ -318,7 +318,7 @@ func (a *mongoAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID, 
 func (a *mongoAuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error) {
 	event, err := BuildChangeEvent(actorID, entityType, entityID, before, after)
 	if err != nil {
-		return 0, fmt.Errorf("graudit/mongo: record change: %w", err)
+		return 0, fmt.Errorf("graudit: record change: %w", err)
 	}
 	return a.Record(ctx, event)
 }
@@ -339,13 +339,13 @@ func (a *mongoAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, Ver
 		bson.M{"entryId": bson.M{"$gte": uint64(from), "$lte": uint64(to)}},
 		options.Find().SetSort(bson.D{{Key: "entryId", Value: 1}}))
 	if err != nil {
-		return false, VerifyResult{}, fmt.Errorf("graudit/mongo: verify: %w", ErrBackendUnavailable)
+		return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", ErrBackendUnavailable)
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
 	var docs []entryDocument
 	if err := cursor.All(ctx, &docs); err != nil {
-		return false, VerifyResult{}, fmt.Errorf("graudit/mongo: verify: %w", ErrBackendUnavailable)
+		return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", ErrBackendUnavailable)
 	}
 
 	var prevHash string
@@ -362,11 +362,11 @@ func (a *mongoAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, Ver
 
 		payload, err := DecodeStoredPayload(doc.Payload)
 		if err != nil {
-			return false, VerifyResult{}, fmt.Errorf("graudit/mongo: verify: %w", err)
+			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
 		recomputed, err := ComputeHash(EntryID(doc.EntryID), doc.ActorID, doc.EntityType, doc.EntityID, doc.Action, payload, doc.Timestamp, doc.PrevHash)
 		if err != nil {
-			return false, VerifyResult{}, fmt.Errorf("graudit/mongo: verify: %w", err)
+			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
 		if recomputed != doc.Hash {
 			return false, VerifyResult{
@@ -414,20 +414,20 @@ func (a *mongoAuditLog) Query(ctx context.Context, filter QueryFilter) ([]AuditE
 
 	cursor, err := a.entries.Find(ctx, q, opts)
 	if err != nil {
-		return nil, fmt.Errorf("graudit/mongo: query: %w", ErrBackendUnavailable)
+		return nil, fmt.Errorf("graudit: query: %w", ErrBackendUnavailable)
 	}
 	defer func() { _ = cursor.Close(ctx) }()
 
 	var docs []entryDocument
 	if err := cursor.All(ctx, &docs); err != nil {
-		return nil, fmt.Errorf("graudit/mongo: query: %w", ErrBackendUnavailable)
+		return nil, fmt.Errorf("graudit: query: %w", ErrBackendUnavailable)
 	}
 
 	out := make([]AuditEvent, 0, len(docs))
 	for _, doc := range docs {
 		event, err := doc.toAuditEvent()
 		if err != nil {
-			return nil, fmt.Errorf("graudit/mongo: query: %w", err)
+			return nil, fmt.Errorf("graudit: query: %w", err)
 		}
 		out = append(out, event)
 	}
@@ -442,7 +442,7 @@ func (a *mongoAuditLog) Close() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		err = a.client.Disconnect(ctx)
-		a.logger.Infof("graudit/mongo: audit log closed")
+		a.logger.Infof("graudit: audit log closed")
 	})
 	return err
 }
