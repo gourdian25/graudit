@@ -29,9 +29,9 @@ func TestAuditEvent_Validate_MissingFields(t *testing.T) {
 }
 
 // TestAuditEvent_Validate_MissingChainID_WrapsBothSentinels confirms an
-// empty ChainID dual-wraps ErrInvalidEvent and ErrChainIDRequired together
-// (decision #5 in docs/plan/multi-chain-support-plan.md): errors.Is must
-// match either sentinel regardless of which method ultimately caught it.
+// empty ChainID dual-wraps ErrInvalidEvent and ErrChainIDRequired together:
+// errors.Is must match either sentinel regardless of which method
+// ultimately caught it.
 func TestAuditEvent_Validate_MissingChainID_WrapsBothSentinels(t *testing.T) {
 	event := AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}
 	err := event.Validate()

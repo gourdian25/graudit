@@ -13,8 +13,8 @@ multi-tenant deployment, plus a separate chain for platform-operator
 actions — instead of exactly one global chain per instance. Also adds
 `PostgresConfig.Pool` injection. Contains **breaking changes** (allowed
 pre-1.0); confirmed no existing graudit-backed deployment needed to be
-preserved across this release (see
-`docs/plan/multi-chain-support-plan.md`).
+preserved across this release, so no migration tooling ships (see
+Migration below).
 
 ### Added
 

@@ -71,9 +71,9 @@ independently (they are separate code paths in every backend): postgres's
 `chain_id`/`chainId`, matching `Query`'s own filtering.
 
 No migration tooling exists for upgrading a pre-multi-chain deployment
-(confirmed no such deployment needs to be preserved when this was added —
-see `docs/plan/multi-chain-support-plan.md`), matching this repo's
-existing precedent of shipping schema-affecting breaking changes pre-1.0
+(confirmed no such deployment needed to be preserved when this was added),
+matching this repo's existing precedent of shipping schema-affecting
+breaking changes pre-1.0
 without migration tooling (the `v0.3.0` package-flatten/GORM-removal
 release did the same). Postgres has no `ALTER TABLE` path — `CREATE TABLE
 IF NOT EXISTS` no-ops against an existing, differently-shaped table, so an
