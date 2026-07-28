@@ -117,7 +117,7 @@ func valueOrNil(ok bool, v any) any {
 // which of before/after is nil ("create" if before is nil, "delete" if
 // after is nil, "update" otherwise) so the returned event already passes
 // AuditEvent.Validate without the caller needing to set it explicitly.
-func BuildChangeEvent(actorID, entityType, entityID string, before, after any) (AuditEvent, error) {
+func BuildChangeEvent(chainID, actorID, entityType, entityID string, before, after any) (AuditEvent, error) {
 	diff, err := computeDiff(before, after)
 	if err != nil {
 		return AuditEvent{}, err
@@ -132,6 +132,7 @@ func BuildChangeEvent(actorID, entityType, entityID string, before, after any) (
 	}
 
 	return AuditEvent{
+		ChainID:    chainID,
 		ActorID:    actorID,
 		EntityType: entityType,
 		EntityID:   entityID,

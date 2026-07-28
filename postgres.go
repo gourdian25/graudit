@@ -38,11 +38,19 @@ import (
 //go:embed internal/postgresdb/schema.sql
 var postgresSchemaSQL string
 
-// chainLockKey is the constant pg_advisory_xact_lock key for graudit's one
-// global chain in v1 — there is no per-tenant/per-chain partitioning yet
-// (see docs/architecture.md for the extension note). Scoped to a single
-// transaction (released automatically on commit/rollback) — distinct in
-// purpose and lifetime from grauditSchemaLockKey below, which guards schema
+// chainLockKey is the constant pg_advisory_xact_lock key used to serialize
+// Record across every chain in this database — deliberately global, not
+// yet chain-scoped (see docs/architecture.md's "extension note," now
+// actioned): GetLastEntry/InsertEntry/ListEntriesInRange are all
+// chain_id-filtered, so a single global lock is strictly stronger than
+// required (it also serializes unrelated chains against each other) but
+// never incorrect — over-serialization is a throughput cost, not a
+// correctness gap. Narrowing this to a per-chain lock (via
+// pg_advisory_xact_lock's two-int32-argument form, keying the second
+// argument off a hash of chainID) is tracked as a separate, later
+// refinement — see docs/architecture.md. Scoped to a single transaction
+// (released automatically on commit/rollback) — distinct in purpose and
+// lifetime from grauditSchemaLockKey below, which guards schema
 // application at connect time, not per-Record serialization.
 const chainLockKey int64 = 892374651
 
@@ -217,7 +225,7 @@ func postgresEntryToAuditEvent(row postgresdb.GrauditEntry) (AuditEvent, error) 
 		return AuditEvent{}, err
 	}
 	return AuditEvent{
-		ID: pgEntryID(row.EntryID), ActorID: row.ActorID, EntityType: row.EntityType, EntityID: row.EntityID,
+		ChainID: row.ChainID, ID: pgEntryID(row.EntryID), ActorID: row.ActorID, EntityType: row.EntityType, EntityID: row.EntityID,
 		Action: row.Action, Payload: payload, Timestamp: row.Timestamp.Time.UTC(), Hash: row.Hash, PrevHash: row.PrevHash,
 	}, nil
 }
@@ -253,24 +261,24 @@ func (a *postgresAuditLog) Record(ctx context.Context, event AuditEvent) (EntryI
 		q := a.q.WithTx(tx)
 		prevHash := GenesisPrevHash
 		nextID := EntryID(1)
-		last, err := q.GetLastEntry(ctx)
+		last, err := q.GetLastEntry(ctx, event.ChainID)
 		switch {
 		case err == nil:
 			prevHash = last.Hash
 			nextID = pgEntryID(last.EntryID) + 1
 		case errors.Is(err, pgx.ErrNoRows):
-			// genesis: no rows yet
+			// genesis: no rows yet for this chain
 		default:
 			return err
 		}
 
-		hash, err := ComputeHash(nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
+		hash, err := ComputeHash(event.ChainID, nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
 		if err != nil {
 			return err
 		}
 
 		if err := q.InsertEntry(ctx, postgresdb.InsertEntryParams{
-			EntryID: toPgEntryID(nextID), ActorID: event.ActorID, EntityType: event.EntityType, EntityID: event.EntityID,
+			ChainID: event.ChainID, EntryID: toPgEntryID(nextID), ActorID: event.ActorID, EntityType: event.EntityType, EntityID: event.EntityID,
 			Action: event.Action, Payload: payloadBytes, Timestamp: pgTimestamptz(event.Timestamp), Hash: hash, PrevHash: prevHash,
 		}); err != nil {
 			return err
@@ -290,8 +298,8 @@ func (a *postgresAuditLog) Record(ctx context.Context, event AuditEvent) (EntryI
 
 // RecordChange implements AuditLog.RecordChange; see the interface's doc
 // comment for the full contract.
-func (a *postgresAuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error) {
-	event, err := BuildChangeEvent(actorID, entityType, entityID, before, after)
+func (a *postgresAuditLog) RecordChange(ctx context.Context, chainID, actorID, entityType, entityID string, before, after any) (EntryID, error) {
+	event, err := BuildChangeEvent(chainID, actorID, entityType, entityID, before, after)
 	if err != nil {
 		return 0, fmt.Errorf("graudit: record change: %w", err)
 	}
@@ -304,15 +312,18 @@ func (a *postgresAuditLog) RecordChange(ctx context.Context, actorID, entityType
 // PrevHash equals the immediately preceding entry's stored Hash. Both are
 // required — Check A alone would not detect a deleted row or a rewritten
 // PrevHash pointing at a tampered predecessor.
-func (a *postgresAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, VerifyResult, error) {
+func (a *postgresAuditLog) Verify(ctx context.Context, chainID string, from, to EntryID) (bool, VerifyResult, error) {
 	if a.closed.Load() {
 		return false, VerifyResult{}, ErrClosed
+	}
+	if chainID == "" {
+		return false, VerifyResult{}, ErrChainIDRequired
 	}
 	if from < 1 {
 		from = 1
 	}
 
-	rows, err := a.q.ListEntriesInRange(ctx, postgresdb.ListEntriesInRangeParams{FromID: toPgEntryID(from), ToID: toPgEntryID(to)})
+	rows, err := a.q.ListEntriesInRange(ctx, postgresdb.ListEntriesInRangeParams{ChainID: chainID, FromID: toPgEntryID(from), ToID: toPgEntryID(to)})
 	if err != nil {
 		return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", ErrBackendUnavailable)
 	}
@@ -333,7 +344,7 @@ func (a *postgresAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, 
 		if err != nil {
 			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
-		recomputed, err := ComputeHash(pgEntryID(row.EntryID), row.ActorID, row.EntityType, row.EntityID, row.Action, payload, row.Timestamp.Time, row.PrevHash)
+		recomputed, err := ComputeHash(row.ChainID, pgEntryID(row.EntryID), row.ActorID, row.EntityType, row.EntityID, row.Action, payload, row.Timestamp.Time, row.PrevHash)
 		if err != nil {
 			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
@@ -354,8 +365,11 @@ func (a *postgresAuditLog) Query(ctx context.Context, filter QueryFilter) ([]Aud
 	if a.closed.Load() {
 		return nil, ErrClosed
 	}
+	if filter.ChainID == "" {
+		return nil, ErrChainIDRequired
+	}
 
-	var params postgresdb.QueryEntriesParams
+	params := postgresdb.QueryEntriesParams{ChainID: filter.ChainID}
 	if filter.ActorID != "" {
 		params.ActorID = pgtype.Text{String: filter.ActorID, Valid: true}
 	}

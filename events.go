@@ -37,6 +37,7 @@ func PublishRecorded(ctx context.Context, bus grevents.Bus, logger Logger, entry
 		Topic:   TopicAuditRecorded,
 		Payload: entry,
 		Metadata: map[string]string{
+			"chain_id":    entry.ChainID,
 			"actor_id":    entry.ActorID,
 			"entity_type": entry.EntityType,
 			"entity_id":   entry.EntityID,

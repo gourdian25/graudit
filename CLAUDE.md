@@ -30,8 +30,9 @@ as "cryptographically un-forgeable" in any documentation change.
 make test             # go test -cover ./...
 make race             # go test -race ./...  (mandatory before any commit touching the hash-chain or serialization code)
 make coverage         # HTML coverage report
+make coverage-summary # coverage by function (go tool cover -func)
 make coverage-check   # verify the root package meets 95% coverage
-make bench            # go test -bench=. -benchmem -benchtime=10s ./...
+make bench            # go test -bench=. -benchmem -benchtime=10s ./...  (no Benchmark* funcs exist yet — builds/passes but times nothing)
 make lint             # golangci-lint run ./...
 make vet              # go vet ./...
 make fmt              # gofmt
@@ -192,6 +193,15 @@ unreachable rather than force-covered (see comments at each site in
 of a plain Go string can never fail, and a Postgres `jsonb` column
 guarantees valid JSON at the type level, so `DecodeStoredPayload`'s error
 branch is genuinely unreachable via SQL-level corruption on that backend.
+
+`.golangci.yml` enables `gosec`/`misspell`/`gocritic`/`revive` on top of
+the standard set, with two deliberate exclusions: `gosec`/`errcheck`/
+`gocritic` are off for `_test.go` files and `example/example.go` (test
+doubles and demo code use test-controlled inputs by design), and revive's
+`unused-parameter` rule is disabled repo-wide because `AuditLog`/`Logger`/
+`grevents.Bus` are fixed interface shapes where dropping an unused
+parameter's name would make implementations harder to read against the
+interface they satisfy.
 
 ## Repo conventions
 

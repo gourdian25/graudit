@@ -10,6 +10,7 @@ import (
 )
 
 type GrauditEntry struct {
+	ChainID    string             `db:"chain_id" json:"chain_id"`
 	EntryID    int64              `db:"entry_id" json:"entry_id"`
 	ActorID    string             `db:"actor_id" json:"actor_id"`
 	EntityType string             `db:"entity_type" json:"entity_type"`

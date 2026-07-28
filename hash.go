@@ -16,16 +16,33 @@ import (
 // ComputeHash computes the SHA-256 hex-encoded hash for a single chain
 // entry:
 //
-//	SHA256(entryID || actorID || entityType || entityID || action ||
-//	       canonicalJSON(payload) || timestamp || prevHash)
+//	SHA256(chainID || entryID || actorID || entityType || entityID ||
+//	       action || canonicalJSON(payload) || timestamp || prevHash)
 //
 // Exported so all three backends (memory, postgres, mongo) call the
 // identical function — if a backend computed hashes even slightly
 // differently, Verify() would disagree across backends for logically
 // identical data, undermining the entire tamper-evidence claim.
 //
+// chainID is included first and is load-bearing, not cosmetic: without it,
+// an attacker with direct database access could rewrite one entry's chain
+// identifier — splicing it from one chain into another — without
+// invalidating its stored Hash, since EntryID sequences independently
+// restart at 1 in every chain and two entries from different chains could
+// otherwise share an identical (EntryID, ActorID, EntityType, EntityID,
+// Action, Payload, Timestamp, PrevHash) tuple. Baking chainID into the hash
+// preimage means reproducing an entry's Hash under a different chainID
+// requires breaking SHA-256, not just editing a column. GenesisPrevHash
+// does not need to become chain-specific for the same reason: since
+// chainID is in every entry's preimage including entry #1's, two chains'
+// genesis entries sharing that one well-known PrevHash constant still hash
+// differently. This guarantee only holds if every backend's Verify (not
+// just Query) scopes its own row-fetch to one chainID — see postgres.go's
+// ListEntriesInRange and mongo.go's Verify.
+//
 // Parameters:
-//   - entryID: EntryID — this entry's chain position
+//   - chainID: string — the chain this entry belongs to; see above
+//   - entryID: EntryID — this entry's position within chainID
 //   - actorID, entityType, entityID, action: string — included verbatim
 //   - payload: any — normalized via canonicalJSON before hashing (see its
 //     doc comment for the determinism guarantee); may be nil
@@ -52,13 +69,14 @@ import (
 //   - string: lowercase hex-encoded SHA-256 digest
 //   - error: non-nil only if payload cannot be marshaled to JSON at all
 //     (e.g. contains a channel, func, or unsupported value)
-func ComputeHash(entryID EntryID, actorID, entityType, entityID, action string, payload any, timestamp time.Time, prevHash string) (string, error) {
+func ComputeHash(chainID string, entryID EntryID, actorID, entityType, entityID, action string, payload any, timestamp time.Time, prevHash string) (string, error) {
 	canon, err := canonicalJSON(payload)
 	if err != nil {
 		return "", fmt.Errorf("graudit: compute hash: %w", err)
 	}
 
 	var buf bytes.Buffer
+	buf.WriteString(chainID)
 	buf.WriteString(strconv.FormatUint(uint64(entryID), 10))
 	buf.WriteString(actorID)
 	buf.WriteString(entityType)
