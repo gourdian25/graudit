@@ -42,6 +42,7 @@
 ├── mongo_test.go
 ├── postgres.go
 ├── postgres_test.go
-└── sqlc.yaml
+├── sqlc.yaml
+└── version.go
 
-6 directories, 38 files
+6 directories, 39 files

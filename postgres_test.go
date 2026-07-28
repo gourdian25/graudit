@@ -5,6 +5,8 @@ package graudit
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +30,16 @@ const postgresTestDSN = "host=localhost user=postgres_user password=postgres_pas
 // actually just test-isolation bugs. Errors are ignored (surfaced properly
 // by the subsequent NewPostgresAuditLog call's own connect/ping instead) so
 // this is safe to call even when Postgres isn't reachable at all.
+//
+// DROP TABLE (not TRUNCATE): this table's schema itself changes across
+// graudit versions (e.g. the chain_id column/composite primary key added
+// for multi-chain support) — CREATE TABLE IF NOT EXISTS inside
+// NewPostgresAuditLog no-ops against an existing, differently-shaped
+// table, so TRUNCATE alone would silently leave a locally-iterated-on test
+// database on the old schema and fail every test with a confusing "column
+// does not exist" error instead of an obviously schema-related one.
+// Dropping and letting schema application recreate it from scratch makes
+// the local/CI loop self-healing across any future schema change too.
 func truncatePostgresTestDB() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -40,7 +52,7 @@ func truncatePostgresTestDB() {
 
 	// Ignored if the table doesn't exist yet — schema application inside
 	// NewPostgresAuditLog creates it on first connect.
-	_, _ = pool.Exec(ctx, "TRUNCATE TABLE graudit_entries")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS graudit_entries")
 }
 
 func newPostgresLog() (AuditLog, error) {
@@ -56,7 +68,7 @@ func newPostgresLogWithBus(bus *stubBus) (AuditLog, error) {
 // tamperPostgresEntry bypasses the AuditLog interface entirely via a raw
 // SQL UPDATE against the same test DB, simulating an attacker or a bug
 // elsewhere touching the table directly.
-func tamperPostgresEntry(t *testing.T, log AuditLog, entryID EntryID) {
+func tamperPostgresEntry(t *testing.T, log AuditLog, chainID string, entryID EntryID) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -67,7 +79,7 @@ func tamperPostgresEntry(t *testing.T, log AuditLog, entryID EntryID) {
 	}
 	defer pool.Close()
 
-	tag, err := pool.Exec(ctx, `UPDATE graudit_entries SET payload = $1 WHERE entry_id = $2`, []byte(`{"tampered":true}`), int64(entryID))
+	tag, err := pool.Exec(ctx, `UPDATE graudit_entries SET payload = $1 WHERE chain_id = $2 AND entry_id = $3`, []byte(`{"tampered":true}`), chainID, int64(entryID))
 	if err != nil {
 		t.Fatalf("tamper UPDATE: %v", err)
 	}
@@ -120,6 +132,132 @@ func TestNewPostgresAuditLog_FullConfig(t *testing.T) {
 	defer log.Close()
 }
 
+// TestNewPostgresAuditLog_DSNXorPoolRequired covers connectPostgres's
+// validation that exactly one of PostgresConfig.DSN/Pool is set — neither
+// (already covered by TestNewPostgresAuditLog_MissingDSN, re-asserted here
+// alongside its counterpart for symmetry) and both are equally invalid.
+func TestNewPostgresAuditLog_DSNXorPoolRequired(t *testing.T) {
+	if _, err := NewPostgresAuditLog(PostgresConfig{}); err == nil {
+		t.Fatal("NewPostgresAuditLog(neither DSN nor Pool) = nil error, want non-nil")
+	}
+
+	pool, err := pgxpool.New(context.Background(), postgresTestDSN)
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+
+	if _, err := NewPostgresAuditLog(PostgresConfig{DSN: postgresTestDSN, Pool: pool}); err == nil {
+		t.Fatal("NewPostgresAuditLog(both DSN and Pool set) = nil error, want non-nil")
+	}
+}
+
+// TestNewPostgresAuditLog_ExternalPoolPingFails covers connectPostgres's
+// Pool-branch Ping failure — the Pool-supplied analogue of
+// TestNewPostgresAuditLog_BadDSN, which covers the same failure on the
+// DSN-dialing path. An already-closed pool fails Ping deterministically,
+// with no live-server fault injection required.
+func TestNewPostgresAuditLog_ExternalPoolPingFails(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), postgresTestDSN)
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	pool.Close()
+
+	if _, err := NewPostgresAuditLog(PostgresConfig{Pool: pool}); err == nil {
+		t.Fatal("NewPostgresAuditLog(Pool: <closed pool>) = nil error, want non-nil")
+	}
+}
+
+// TestNewPostgresAuditLog_WithExternalPool constructs an AuditLog from a
+// caller-supplied *pgxpool.Pool (PostgresConfig.Pool) instead of a DSN, and
+// confirms Record/Query work normally against it — the multi-tenant use
+// case this exists for: one AuditLog instance sharing a pool the rest of
+// the application already owns, rather than dialing its own per tenant.
+func TestNewPostgresAuditLog_WithExternalPool(t *testing.T) {
+	truncatePostgresTestDB()
+	ctx := context.Background()
+
+	pool, err := pgxpool.New(ctx, postgresTestDSN)
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+
+	log, err := NewPostgresAuditLog(PostgresConfig{Pool: pool})
+	if err != nil {
+		t.Fatalf("NewPostgresAuditLog(Pool: pool): %v", err)
+	}
+	defer log.Close()
+
+	id, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"})
+	if err != nil {
+		t.Fatalf("Record via external pool: %v", err)
+	}
+	if id != 1 {
+		t.Fatalf("Record via external pool: id = %d, want 1", id)
+	}
+
+	events, err := log.Query(ctx, QueryFilter{ChainID: testChainID})
+	if err != nil {
+		t.Fatalf("Query via external pool: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("Query via external pool: got %d events, want 1", len(events))
+	}
+}
+
+// TestPostgresAuditLog_SharedPool_CloseDoesNotClosePool is the regression
+// test for ownsPool: an AuditLog built from an externally-supplied Pool
+// must not close that pool on Close() — the pool, and anything else
+// sharing it (here, a second AuditLog instance), must remain usable
+// afterward. Mirrors grnoti's own
+// TestPostgresStores_SharedPool_CloseDoesNotAffectSiblingStore.
+func TestPostgresAuditLog_SharedPool_CloseDoesNotClosePool(t *testing.T) {
+	truncatePostgresTestDB()
+	ctx := context.Background()
+
+	pool, err := pgxpool.New(ctx, postgresTestDSN)
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+
+	log1, err := NewPostgresAuditLog(PostgresConfig{Pool: pool})
+	if err != nil {
+		t.Fatalf("NewPostgresAuditLog(Pool: pool) [1st]: %v", err)
+	}
+	log2, err := NewPostgresAuditLog(PostgresConfig{Pool: pool})
+	if err != nil {
+		t.Fatalf("NewPostgresAuditLog(Pool: pool) [2nd]: %v", err)
+	}
+
+	if err := log1.Close(); err != nil {
+		t.Fatalf("log1.Close(): %v", err)
+	}
+
+	// The shared pool, and the sibling AuditLog still using it, must
+	// remain usable after log1.Close() — proving Close() didn't close a
+	// pool it doesn't own.
+	if _, err := log2.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+		t.Fatalf("Record on log2 after log1.Close(): %v", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("pool.Ping() after log1.Close(): %v, want the shared pool to still be open", err)
+	}
+
+	_ = log2.Close()
+}
+
 func TestPostgresSchemaApplyIsIdempotent(t *testing.T) {
 	log1, err := newPostgresLog()
 	if err != nil {
@@ -141,7 +279,7 @@ func TestPostgresAuditLog_RecordChange_InvalidPayload(t *testing.T) {
 	}
 	defer log.Close()
 
-	if _, err := log.RecordChange(context.Background(), "actor:1", "widget", "w1", make(chan int), nil); !errors.Is(err, ErrInvalidEvent) {
+	if _, err := log.RecordChange(context.Background(), testChainID, "actor:1", "widget", "w1", make(chan int), nil); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("RecordChange with an unmarshalable before value: err=%v, want ErrInvalidEvent", err)
 	}
 }
@@ -153,3 +291,71 @@ func TestPostgresAuditLog_RecordChange_InvalidPayload(t *testing.T) {
 // fails with SQLSTATE 22P02 before it ever reaches DecodeStoredPayload),
 // so that error branch is genuinely unreachable via SQL-level corruption
 // on this backend, not an untested gap.
+
+// BenchmarkPostgresAuditLog_Record_ChainConcurrency is this repo's
+// first-ever Benchmark* function (make bench previously built and passed
+// but exercised nothing), added to give the chainLockSubKey narrowing in
+// postgres.go's Record (see docs/architecture.md's "Postgres advisory-lock
+// chain scoping" section) something concrete to compare before/after: the
+// SameChain subbenchmark has every parallel goroutine write to one shared
+// chain (fully serialized by the advisory lock, same as before this
+// narrowing), CrossChain gives each goroutine its own chain (no
+// serialization between them since Stage 2). This is a manually-run
+// comparison, not a CI gate — no assertion here would be meaningful, since
+// relative throughput depends on the machine and Postgres instance running
+// it. Run with:
+//
+//	go test -run '^$' -bench BenchmarkPostgresAuditLog_Record_ChainConcurrency -benchmem -benchtime=3s .
+func BenchmarkPostgresAuditLog_Record_ChainConcurrency(b *testing.B) {
+	if _, err := newPostgresLog(); err != nil {
+		b.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+
+	b.Run("SameChain", func(b *testing.B) {
+		log, err := newPostgresLog()
+		if err != nil {
+			b.Fatalf("newPostgresLog: %v", err)
+		}
+		defer log.Close()
+		ctx := context.Background()
+
+		var n int64
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				id := atomic.AddInt64(&n, 1)
+				if _, err := log.Record(ctx, AuditEvent{
+					ChainID: testChainID, ActorID: "bench", EntityType: "t", EntityID: fmt.Sprintf("%d", id), Action: "create",
+				}); err != nil {
+					b.Fatalf("Record: %v", err)
+				}
+			}
+		})
+	})
+
+	b.Run("CrossChain", func(b *testing.B) {
+		log, err := newPostgresLog()
+		if err != nil {
+			b.Fatalf("newPostgresLog: %v", err)
+		}
+		defer log.Close()
+		ctx := context.Background()
+
+		var n, worker int64
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			// Each parallel goroutine (RunParallel's own unit of work)
+			// gets its own chain, so no two goroutines ever contend for
+			// the same chainLockSubKey.
+			chainID := fmt.Sprintf("bench-chain-%d", atomic.AddInt64(&worker, 1))
+			for pb.Next() {
+				id := atomic.AddInt64(&n, 1)
+				if _, err := log.Record(ctx, AuditEvent{
+					ChainID: chainID, ActorID: "bench", EntityType: "t", EntityID: fmt.Sprintf("%d", id), Action: "create",
+				}); err != nil {
+					b.Fatalf("Record: %v", err)
+				}
+			}
+		})
+	})
+}

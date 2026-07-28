@@ -46,16 +46,24 @@ func WithEventBus(bus grevents.Bus) MemoryOption {
 // expected, not a bug. Use graudit's postgres or mongo backend for state
 // that must be shared and durable.
 type memoryAuditLog struct {
-	mu       sync.Mutex // guards entries + lastHash + lastID together: this IS the serialization point
-	entries  []AuditEvent
-	lastHash string
-	lastID   EntryID
+	mu      sync.Mutex // guards entries + chains together: this IS the serialization point
+	entries []AuditEvent
+	chains  map[string]*memoryChainTail // one entry per ChainID ever recorded
 
 	logger Logger
 	bus    grevents.Bus
 
 	closed    atomic.Bool
 	closeOnce sync.Once
+}
+
+// memoryChainTail tracks one chain's current end — the same information
+// postgresAuditLog derives from GetLastEntry and mongoAuditLog stores in
+// its chain-state singleton document, kept in memory here since there's no
+// separate storage to query it back from.
+type memoryChainTail struct {
+	lastID   EntryID
+	lastHash string
 }
 
 var _ AuditLog = (*memoryAuditLog)(nil)
@@ -73,6 +81,7 @@ var _ AuditLog = (*memoryAuditLog)(nil)
 func NewMemoryAuditLog(opts ...MemoryOption) (AuditLog, error) {
 	a := &memoryAuditLog{
 		logger: NopLogger(),
+		chains: make(map[string]*memoryChainTail),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -98,12 +107,13 @@ func (a *memoryAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID,
 	a.mu.Lock()
 
 	prevHash := GenesisPrevHash
-	if a.lastID > 0 {
-		prevHash = a.lastHash
+	nextID := EntryID(1)
+	if tail := a.chains[event.ChainID]; tail != nil {
+		prevHash = tail.lastHash
+		nextID = tail.lastID + 1
 	}
-	nextID := a.lastID + 1
 
-	hash, err := ComputeHash(nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
+	hash, err := ComputeHash(event.ChainID, nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
 	if err != nil {
 		a.mu.Unlock()
 		return 0, fmt.Errorf("graudit: record: %w", err)
@@ -114,8 +124,7 @@ func (a *memoryAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID,
 	event.PrevHash = prevHash
 
 	a.entries = append(a.entries, event)
-	a.lastID = nextID
-	a.lastHash = hash
+	a.chains[event.ChainID] = &memoryChainTail{lastID: nextID, lastHash: hash}
 
 	a.mu.Unlock()
 
@@ -125,8 +134,8 @@ func (a *memoryAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID,
 
 // RecordChange implements AuditLog.RecordChange; see the interface's doc
 // comment for the full contract.
-func (a *memoryAuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error) {
-	event, err := BuildChangeEvent(actorID, entityType, entityID, before, after)
+func (a *memoryAuditLog) RecordChange(ctx context.Context, chainID, actorID, entityType, entityID string, before, after any) (EntryID, error) {
+	event, err := BuildChangeEvent(chainID, actorID, entityType, entityID, before, after)
 	if err != nil {
 		return 0, fmt.Errorf("graudit: record change: %w", err)
 	}
@@ -136,9 +145,12 @@ func (a *memoryAuditLog) RecordChange(ctx context.Context, actorID, entityType, 
 // Verify implements AuditLog.Verify; see the interface's doc comment for
 // the full contract and verifyChain's doc comment for the two-check
 // design.
-func (a *memoryAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, VerifyResult, error) {
+func (a *memoryAuditLog) Verify(ctx context.Context, chainID string, from, to EntryID) (bool, VerifyResult, error) {
 	if a.closed.Load() {
 		return false, VerifyResult{}, ErrClosed
+	}
+	if chainID == "" {
+		return false, VerifyResult{}, ErrChainIDRequired
 	}
 	if from < 1 {
 		from = 1
@@ -147,7 +159,7 @@ func (a *memoryAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, Ve
 	a.mu.Lock()
 	entries := make([]AuditEvent, 0, len(a.entries))
 	for _, e := range a.entries {
-		if e.ID >= from && e.ID <= to {
+		if e.ChainID == chainID && e.ID >= from && e.ID <= to {
 			entries = append(entries, e)
 		}
 	}
@@ -176,7 +188,7 @@ func verifyMemoryChain(entries []AuditEvent) (bool, VerifyResult, error) {
 			}, nil
 		}
 
-		recomputed, err := ComputeHash(e.ID, e.ActorID, e.EntityType, e.EntityID, e.Action, e.Payload, e.Timestamp, e.PrevHash)
+		recomputed, err := ComputeHash(e.ChainID, e.ID, e.ActorID, e.EntityType, e.EntityID, e.Action, e.Payload, e.Timestamp, e.PrevHash)
 		if err != nil {
 			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
@@ -199,12 +211,18 @@ func (a *memoryAuditLog) Query(ctx context.Context, filter QueryFilter) ([]Audit
 	if a.closed.Load() {
 		return nil, ErrClosed
 	}
+	if filter.ChainID == "" {
+		return nil, ErrChainIDRequired
+	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	var out []AuditEvent
 	for _, e := range a.entries {
+		if e.ChainID != filter.ChainID {
+			continue
+		}
 		if filter.ActorID != "" && e.ActorID != filter.ActorID {
 			continue
 		}

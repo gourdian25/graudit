@@ -37,6 +37,94 @@ to serialize the actual chain-append transaction as it always has. The two
 locks protect different things at different times and are never held
 simultaneously, so there's no reason to unify them into one key.
 
+## Multi-chain support: `ChainID` must be part of the hash preimage
+
+graudit originally supported exactly one global chain per `AuditLog`
+instance — `EntryID` was one strictly-increasing sequence with no
+partitioning. This was extended so one `AuditLog` instance (one connection
+pool) can serve any number of independent chains simultaneously (e.g. one
+per tenant in a multi-tenant deployment, plus a separate chain for
+platform-operator actions) — every `Record`/`RecordChange`/`Verify`/`Query`
+call now takes a `ChainID`, and `EntryID` sequences/`PrevHash` linkage are
+scoped per `ChainID` rather than globally. `ChainID` is mandatory and fail-
+loud everywhere (`ErrChainIDRequired`) — an audit trail silently treating
+an empty `ChainID` as an implicit default chain would risk one tenant's
+entries landing in, or a query silently returning, another tenant's data.
+
+The one design point that isn't optional: `ComputeHash` includes `chainID`
+as the first field in its hash preimage, not just a storage/filter column.
+Without it, an attacker with direct database access could rewrite one
+entry's `chain_id` column — splicing it from one chain into another —
+without invalidating its stored `Hash`, since `EntryID` sequences
+independently restart at 1 in every chain and two entries from different
+chains could otherwise share an identical `(EntryID, ActorID, EntityType,
+EntityID, Action, Payload, Timestamp, PrevHash)` tuple. Baking `chainID`
+into the preimage means reproducing an entry's `Hash` under a different
+`chainID` requires breaking SHA-256, not editing a column.
+`GenesisPrevHash` does not need to become chain-specific for the same
+reason: since `chainID` is in every entry's preimage including entry #1's,
+two chains' genesis entries sharing that one well-known `PrevHash` constant
+still hash differently. This guarantee only holds if every backend's
+`Verify` — not just `Query` — scopes its own row-fetch to one `chainID`
+independently (they are separate code paths in every backend): postgres's
+`ListEntriesInRange` and mongo's `Verify`-side `Find` both filter on
+`chain_id`/`chainId`, matching `Query`'s own filtering.
+
+No migration tooling exists for upgrading a pre-multi-chain deployment
+(confirmed no such deployment needed to be preserved when this was added),
+matching this repo's existing precedent of shipping schema-affecting
+breaking changes pre-1.0
+without migration tooling (the `v0.3.0` package-flatten/GORM-removal
+release did the same). Postgres has no `ALTER TABLE` path — `CREATE TABLE
+IF NOT EXISTS` no-ops against an existing, differently-shaped table, so an
+existing deployment needs manual recreation. Mongo's legacy unique index
+`{entryId:1}` must be manually dropped
+(`db.graudit_entries.dropIndex("entryId_1")`) before upgrading an existing
+deployment — left in place alongside the new compound `{chainId:1,
+entryId:1}` index, it would incorrectly reject every second chain's
+`entryId=1`. `ensureAuditIndexes` deliberately does not auto-detect and
+drop this index itself: an unconditional drop would error against a fresh
+deployment where the index never existed.
+
+## Postgres advisory-lock chain scoping
+
+`chainLockKey` originally serialized `Record` across the entire database
+unconditionally — correct for a single global chain, but unnecessarily
+serializes unrelated chains' writes against each other once multiple
+chains share one database. Since `GetLastEntry`/`InsertEntry`/
+`ListEntriesInRange` are all `chain_id`-filtered (see above), a single
+global lock is strictly stronger than required — over-serialization is a
+throughput cost, never a correctness gap — so this was addressed in two
+steps rather than one: multi-chain support itself shipped first with the
+lock left global (still correct, not yet scale-optimal), then narrowed in
+a separate follow-up via Postgres's two-`int32`-argument
+`pg_advisory_xact_lock(key1, key2)` overload: `key1` is the `chainLockKey`
+constant (declared as `int32` directly, since that's its only use now —
+the value itself, `892374651`, is unchanged and always fit in an `int32`),
+`key2` is `chainLockSubKey(chainID)`, an FNV-1a 32-bit hash (`hash/fnv` —
+deliberately not `hash/maphash`, which is randomly reseeded per process and
+would hash the same `chainID` differently across connections, breaking the
+lock's whole purpose: two writers on the same chain must agree on which key
+they're contending for). A hash collision between two different `chainID`s
+only costs extra (harmless) serialization, never corruption, since the SQL
+`chain_id` filter remains authoritative regardless of lock granularity — an
+accepted, low-severity trade-off given `chainID` values are
+tenant-provisioning-assigned, not raw adversarial end-user input, the same
+"document, don't guard" convention already used for `probeDocID` and the
+schema-lock-key collision comments elsewhere in this file. `chainLockKey`
+itself stays a separate constant rather than folding into the hash, purely
+so this library's locks remain trivially distinguishable (by their fixed
+`key1`) from an unrelated advisory lock another tool might take against the
+same database.
+
+The mongo backend needed no equivalent follow-up: keying each chain's
+chain-state singleton document's `_id` directly by the real `chainID`
+string means concurrent `Record` calls on different chains touch disjoint
+documents and never trigger `session.WithTransaction`'s conflict-retry
+against each other — "no artificial serialization graudit's own design
+imposes," not a throughput guarantee beyond normal single-primary write
+ordering, but requiring no lock-scoping work analogous to postgres's.
+
 ## No `SERIAL`/`BIGSERIAL` for `EntryID` in the postgres backend
 
 `EntryID` is explicitly assigned by application code inside the same
@@ -48,19 +136,23 @@ contract `EntryID`'s own doc comment states, and making a legitimate
 rollback-gap indistinguishable from tampering. That ambiguity is exactly
 what a hash chain exists to eliminate, so it can't be tolerated here even
 though it would be a completely normal, unremarkable choice in most other
-schemas.
+schemas. This applies per chain, not globally, since multi-chain support
+was added: the primary key is `(chain_id, entry_id)`, and `EntryID`'s "no
+gaps" contract is scoped to one `chain_id` at a time.
 
 ## The mongo backend requires a replica set unconditionally
 
 Unlike `gourdiantoken`'s `NewMongoTokenRepository(db *mongo.Database,
 useTransactions bool)`, which makes transactions an opt-in escape hatch,
-graudit's `NewMongoAuditLog` (`mongo.go`) has no such flag. The chain's
+graudit's `NewMongoAuditLog` (`mongo.go`) has no such flag. Each chain's
 correctness — not just its behavior under concurrent load — depends on the
 multi-document transaction that atomically updates both the new entry and
-the chain-state tail document. Running without a transaction would let two
-concurrent `Record()` calls interleave in a way that corrupts the chain, so
-construction fails fast (wrapping `ErrReplicaSetRequired`) against a
-standalone deployment rather than silently degrading to a weaker mode.
+that chain's own chain-state document (one per `ChainID`, keyed by `_id` =
+the real `chainID` string — see "Multi-chain support" above). Running
+without a transaction would let two concurrent `Record()` calls on the same
+chain interleave in a way that corrupts it, so construction fails fast
+(wrapping `ErrReplicaSetRequired`) against a standalone deployment rather
+than silently degrading to a weaker mode.
 
 **The fail-fast probe must perform a real operation, not a no-op.** A
 pre-v0.1.0 audit found that `probeTransactionSupport`'s original
@@ -72,9 +164,10 @@ attempted inside the transaction, so the no-op probe silently reported
 Confirmed empirically: MongoDB only rejects a transaction with
 `"Transaction numbers are only allowed on a replica set member or
 mongos"` once a real read/write is attempted inside it. The fix inserts
-and deletes a throwaway document (under a reserved `_id`, distinct from
-the real `"tail"` chain-state document) inside the probe transaction, so
-the check is real but nothing persists either way. See
+and deletes a throwaway document (under a reserved `_id`,
+`__graudit_transaction_probe__`, distinct from any real chain-state
+document a caller's own `chainID` could ever produce) inside the probe
+transaction, so the check is real but nothing persists either way. See
 `mongo_test.go`'s `TestNewMongoAuditLog_RequiresReplicaSet` — this
 test must never be reverted to `t.Skip`, since it is the only thing that
 catches a regression of this exact bug.
@@ -147,6 +240,20 @@ takes functional options (`NewMemoryAuditLog(opts ...MemoryOption)`,
 renamed from the pre-flatten `Option` to avoid an overly generic
 root-package-level name now that all three backends share one package),
 since it has no connection details to configure.
+
+`PostgresConfig` additionally accepts exactly one of `DSN` (dial a new
+`pgxpool.Pool`) or `Pool` (reuse an already-open one the caller owns),
+validated via `(cfg.DSN == "") == (cfg.Pool == nil)` in the shared
+`connectPostgres` helper — mirroring grnoti's own
+`PostgresConfig.Pool`/`connectPostgres`/`ownsPool` pattern exactly, added
+specifically for multi-chain deployments where a single process serves
+many tenant chains and shouldn't open one dedicated connection pool per
+`AuditLog` instance to do it. `postgresAuditLog.ownsPool` records whether
+`connectPostgres` dialed the pool itself (`true`, DSN path) or received it
+externally (`false`, `Pool` path) — `Close()` only closes the pool in the
+former case, since a pool the caller supplied may still be in use
+elsewhere. Mongo and memory have no equivalent injection point (not
+requested).
 
 ## No Redis/memcached backend
 
