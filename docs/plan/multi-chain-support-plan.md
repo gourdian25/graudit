@@ -69,7 +69,7 @@ gotcha (see decision #11 below).
 |---|---|---|
 | Stage 1 | Core multi-chain support (hash, interface, all 3 backends, schema/queries, test retrofit + isolation tests) | ✅ Done |
 | Stage 2 | Postgres advisory-lock chain-scoping (performance only, no behavior change) | ✅ Done |
-| Stage 3 | `PostgresConfig.Pool` injection (mirrors grnoti) | Not started |
+| Stage 3 | `PostgresConfig.Pool` injection (mirrors grnoti) | ✅ Done |
 | Stage 4 | Docs / CHANGELOG / version bump / example.go | Not started |
 | Stage 5 | Full validation pass | Not started |
 
@@ -517,6 +517,55 @@ structurally independent — no chainID interaction.
 (decision #13).
 
 **Verification:** `go vet ./...`, `make race`, `make coverage-check`.
+
+### Stage 3 completion notes
+
+Implemented as planned, with the `connectPostgres` helper taking the exact
+grnoti-mirrored shape (`(ctx, cfg, component string) (*pgxpool.Pool,
+*postgresdb.Queries, bool, error)`) despite graudit having only one
+Postgres-backed caller (`NewPostgresAuditLog`, passing `"AuditLog"` as
+`component`) — kept for ecosystem-convention consistency per the plan's
+own wording ("mirrors grnoti's `postgres.go` pattern exactly"), not because
+graudit needs the parameter today.
+
+One deliberate simplification versus grnoti's own `connectPostgres`: no
+per-branch `appLogger.Error(...)` calls inside the helper (grnoti's
+doesn't have these either — its callers don't log connect failures at
+all). graudit's `NewPostgresAuditLog` now logs once, generically, at the
+call site (`appLogger.Error("graudit: connect failed", "error", err)`)
+instead of the pre-Stage-3 code's three separately-worded log lines
+("open failed" / "ping failed" / — schema errors were never logged
+directly either way). No test asserted the old per-branch log wording, so
+this was a safe consolidation, not a behavior change contract-wise.
+
+`Close()` now guards `a.pool.Close()` behind `a.ownsPool`, matching
+grnoti's `tokenstore.postgres.go` etc. exactly.
+
+**Test-file impact vs. plan:** all three planned tests added
+(`TestNewPostgresAuditLog_WithExternalPool`,
+`TestNewPostgresAuditLog_DSNXorPoolRequired`,
+`TestPostgresAuditLog_SharedPool_CloseDoesNotClosePool` — the last using a
+second `postgresAuditLog` instance as the "sibling" sharing the pool,
+since graudit, unlike grnoti, has only one Postgres-backed type to play
+that role). One test added beyond the plan:
+`TestNewPostgresAuditLog_ExternalPoolPingFails` (an already-closed pool
+passed via `cfg.Pool`, failing `Ping` deterministically) — added to cover
+`connectPostgres`'s Pool-branch Ping-failure line, the Pool-supplied
+analogue of the pre-existing `TestNewPostgresAuditLog_BadDSN` covering the
+same failure on the DSN-dialing path. The Pool-branch's
+`applyPostgresSchema` failure line remains untested (no deterministic way
+to fail schema application against a live, already-Pinged pool without
+fault injection) — accepted per this repo's existing convention of a
+small number of permanently-untested branches, same category as
+`applyPostgresSchema`'s own pre-existing 81.8%-covered branches.
+
+**Verification results:** `go build ./...`, `go vet ./...`, `gofmt -l .`
+all clean. `golangci-lint run ./...`: 0 issues. `go test -race -timeout
+5m .`: full suite green (8.1s). New/changed Stage 3 tests individually
+re-run with `-race -v`: all pass. `make coverage-check`: **95.5%**
+(up from 95.4% pre-Stage-3 — the new tests exercise more of
+`connectPostgres` than the old inline code had coverage for). `bark
+check`: clean.
 
 ## Stage 4 — Docs, CHANGELOG, version bump, example
 

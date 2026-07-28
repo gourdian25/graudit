@@ -83,19 +83,34 @@ const grauditSchemaLockKey int64 = 5_198_204_733
 
 // PostgresConfig configures an AuditLog constructed by NewPostgresAuditLog.
 type PostgresConfig struct {
-	// DSN is a standard libpq/pgx connection string. Required.
+	// DSN is a standard libpq/pgx connection string. Exactly one of DSN or
+	// Pool must be set.
 	DSN string
 
+	// Pool, if set, is used directly instead of dialing a new pool from
+	// DSN — lets graudit share one pgxpool.Pool with the rest of your
+	// application instead of opening its own dedicated connections. This
+	// matters at multi-tenant scale: a deployment serving hundreds of
+	// tenant chains (see docs/architecture.md's multi-chain section) wants
+	// one AuditLog instance backed by one shared pool, not one pool per
+	// tenant. graudit never closes a Pool it did not create itself —
+	// Close only closes the pool when it was dialed from DSN here.
+	// Exactly one of DSN or Pool must be set. Mirrors grnoti's own
+	// PostgresConfig.Pool.
+	Pool *pgxpool.Pool
+
 	// MaxConns caps the pgxpool connection pool size. 0 means use pgxpool's
-	// own default.
+	// own default. Ignored when Pool is set — tune the pool yourself
+	// before passing it in.
 	MaxConns int32
 
 	// MinConns is the minimum number of connections pgxpool keeps ready.
-	// 0 means use pgxpool's own default.
+	// 0 means use pgxpool's own default. Ignored when Pool is set.
 	MinConns int32
 
 	// MaxConnLifetime bounds how long a pooled connection may be reused
 	// before being recycled. 0 means pgxpool's own default (unlimited).
+	// Ignored when Pool is set.
 	MaxConnLifetime time.Duration
 
 	// Logger receives optional diagnostic messages (connection failures,
@@ -116,40 +131,90 @@ type postgresAuditLog struct {
 	logger Logger
 	bus    grevents.Bus
 
+	// ownsPool is true only when pool was dialed from cfg.DSN by
+	// connectPostgres, false when cfg.Pool was supplied externally — Close
+	// must never close a pool it doesn't own.
+	ownsPool bool
+
 	closed    atomic.Bool
 	closeOnce sync.Once
 }
 
 var _ AuditLog = (*postgresAuditLog)(nil)
 
-// NewPostgresAuditLog opens a connection pool per cfg, applies the schema
-// (table graudit_entries, serialized by a Postgres advisory lock so
-// concurrent callers building an audit log against the same fresh database
-// don't race on the DDL), and validates connectivity via Ping before
-// returning.
+// NewPostgresAuditLog opens a connection pool per cfg (or reuses cfg.Pool,
+// if set), applies the schema (table graudit_entries, serialized by a
+// Postgres advisory lock so concurrent callers building an audit log
+// against the same fresh database don't race on the DDL), and validates
+// connectivity via Ping before returning.
 //
 // Parameters:
-//   - cfg: PostgresConfig — DSN is required
+//   - cfg: PostgresConfig — exactly one of DSN or Pool is required
 //
 // Returns:
 //   - AuditLog: ready to use
-//   - error: non-nil if DSN is empty or malformed, the connection/Ping
-//     fails (wrapping ErrBackendUnavailable), or schema application fails
+//   - error: non-nil if DSN/Pool are both set or both unset, DSN is
+//     malformed, the connection/Ping fails (wrapping ErrBackendUnavailable),
+//     or schema application fails
 //
 // Example:
 //
 //	log, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 //		DSN: "host=localhost user=myuser password=mypass dbname=mydb port=5432 sslmode=disable",
 //	})
+//
+// Or, sharing a pool across multiple chains/services (e.g. a multi-tenant
+// deployment where one AuditLog instance serves hundreds of tenant chains —
+// see docs/architecture.md's multi-chain section):
+//
+//	log, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
+//		Pool: sharedPool, // *pgxpool.Pool your application already owns
+//	})
 func NewPostgresAuditLog(cfg PostgresConfig) (AuditLog, error) {
-	if cfg.DSN == "" {
-		return nil, fmt.Errorf("graudit: PostgresConfig.DSN is required")
-	}
 	appLogger := OrNop(cfg.Logger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, q, ownsPool, err := connectPostgres(ctx, cfg, "AuditLog")
+	if err != nil {
+		appLogger.Error("graudit: connect failed", "error", err)
+		return nil, err
+	}
+
+	appLogger.Info("graudit: connected")
+	return &postgresAuditLog{pool: pool, q: q, logger: appLogger, bus: cfg.EventBus, ownsPool: ownsPool}, nil
+}
+
+// connectPostgres resolves cfg to a pgxpool.Pool — either dialing a new one
+// from cfg.DSN or reusing cfg.Pool directly — validates connectivity via
+// Ping, applies the embedded schema, and returns whether the returned pool
+// is owned by this call: true only when dialed from DSN here, false when
+// cfg.Pool was supplied externally, since an externally-supplied pool is
+// never graudit's to close (see postgresAuditLog.ownsPool and Close).
+// Mirrors grnoti's own connectPostgres helper (grnoti/postgres.go) — that
+// package has several Postgres-backed stores sharing this helper, hence
+// the component parameter for error messages; graudit currently has only
+// NewPostgresAuditLog as a caller, but the shape is kept identical for
+// ecosystem consistency.
+func connectPostgres(ctx context.Context, cfg PostgresConfig, component string) (*pgxpool.Pool, *postgresdb.Queries, bool, error) {
+	if (cfg.DSN == "") == (cfg.Pool == nil) {
+		return nil, nil, false, fmt.Errorf("graudit: exactly one of PostgresConfig.DSN or PostgresConfig.Pool is required for %s", component)
+	}
+
+	if cfg.Pool != nil {
+		if err := cfg.Pool.Ping(ctx); err != nil {
+			return nil, nil, false, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
+		}
+		if err := applyPostgresSchema(ctx, cfg.Pool); err != nil {
+			return nil, nil, false, fmt.Errorf("graudit: apply schema: %w", err)
+		}
+		return cfg.Pool, postgresdb.New(cfg.Pool), false, nil
+	}
 
 	poolCfg, err := pgxpool.ParseConfig(cfg.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("graudit: parse dsn: %w", ErrBackendUnavailable)
+		return nil, nil, false, fmt.Errorf("graudit: parse dsn: %w", ErrBackendUnavailable)
 	}
 	if cfg.MaxConns > 0 {
 		poolCfg.MaxConns = cfg.MaxConns
@@ -161,28 +226,22 @@ func NewPostgresAuditLog(cfg PostgresConfig) (AuditLog, error) {
 		poolCfg.MaxConnLifetime = cfg.MaxConnLifetime
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		appLogger.Error("graudit: open failed", "error", err)
-		return nil, fmt.Errorf("graudit: open: %w", ErrBackendUnavailable)
+		return nil, nil, false, fmt.Errorf("graudit: open: %w", ErrBackendUnavailable)
 	}
 
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		appLogger.Error("graudit: ping failed", "error", err)
-		return nil, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
+		return nil, nil, false, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
 	}
 
 	if err := applyPostgresSchema(ctx, pool); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("graudit: apply schema: %w", err)
+		return nil, nil, false, fmt.Errorf("graudit: apply schema: %w", err)
 	}
 
-	appLogger.Info("graudit: connected")
-	return &postgresAuditLog{pool: pool, q: postgresdb.New(pool), logger: appLogger, bus: cfg.EventBus}, nil
+	return pool, postgresdb.New(pool), true, nil
 }
 
 // applyPostgresSchema applies the embedded schema against pool, serialized
@@ -423,11 +482,16 @@ func (a *postgresAuditLog) Query(ctx context.Context, filter QueryFilter) ([]Aud
 	return out, nil
 }
 
-// Close implements AuditLog.Close; idempotent via sync.Once.
+// Close implements AuditLog.Close; idempotent via sync.Once. Only closes
+// the underlying pool when this AuditLog dialed it itself (ownsPool) — a
+// pool supplied via PostgresConfig.Pool is the caller's to close, since
+// other consumers of a shared pool may still be using it.
 func (a *postgresAuditLog) Close() error {
 	a.closeOnce.Do(func() {
 		a.closed.Store(true)
-		a.pool.Close()
+		if a.ownsPool {
+			a.pool.Close()
+		}
 		a.logger.Info("graudit: audit log closed")
 	})
 	return nil

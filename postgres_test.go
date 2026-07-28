@@ -132,6 +132,132 @@ func TestNewPostgresAuditLog_FullConfig(t *testing.T) {
 	defer log.Close()
 }
 
+// TestNewPostgresAuditLog_DSNXorPoolRequired covers connectPostgres's
+// validation that exactly one of PostgresConfig.DSN/Pool is set — neither
+// (already covered by TestNewPostgresAuditLog_MissingDSN, re-asserted here
+// alongside its counterpart for symmetry) and both are equally invalid.
+func TestNewPostgresAuditLog_DSNXorPoolRequired(t *testing.T) {
+	if _, err := NewPostgresAuditLog(PostgresConfig{}); err == nil {
+		t.Fatal("NewPostgresAuditLog(neither DSN nor Pool) = nil error, want non-nil")
+	}
+
+	pool, err := pgxpool.New(context.Background(), postgresTestDSN)
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(context.Background()); err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+
+	if _, err := NewPostgresAuditLog(PostgresConfig{DSN: postgresTestDSN, Pool: pool}); err == nil {
+		t.Fatal("NewPostgresAuditLog(both DSN and Pool set) = nil error, want non-nil")
+	}
+}
+
+// TestNewPostgresAuditLog_ExternalPoolPingFails covers connectPostgres's
+// Pool-branch Ping failure — the Pool-supplied analogue of
+// TestNewPostgresAuditLog_BadDSN, which covers the same failure on the
+// DSN-dialing path. An already-closed pool fails Ping deterministically,
+// with no live-server fault injection required.
+func TestNewPostgresAuditLog_ExternalPoolPingFails(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), postgresTestDSN)
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	pool.Close()
+
+	if _, err := NewPostgresAuditLog(PostgresConfig{Pool: pool}); err == nil {
+		t.Fatal("NewPostgresAuditLog(Pool: <closed pool>) = nil error, want non-nil")
+	}
+}
+
+// TestNewPostgresAuditLog_WithExternalPool constructs an AuditLog from a
+// caller-supplied *pgxpool.Pool (PostgresConfig.Pool) instead of a DSN, and
+// confirms Record/Query work normally against it — the multi-tenant use
+// case this exists for: one AuditLog instance sharing a pool the rest of
+// the application already owns, rather than dialing its own per tenant.
+func TestNewPostgresAuditLog_WithExternalPool(t *testing.T) {
+	truncatePostgresTestDB()
+	ctx := context.Background()
+
+	pool, err := pgxpool.New(ctx, postgresTestDSN)
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+
+	log, err := NewPostgresAuditLog(PostgresConfig{Pool: pool})
+	if err != nil {
+		t.Fatalf("NewPostgresAuditLog(Pool: pool): %v", err)
+	}
+	defer log.Close()
+
+	id, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"})
+	if err != nil {
+		t.Fatalf("Record via external pool: %v", err)
+	}
+	if id != 1 {
+		t.Fatalf("Record via external pool: id = %d, want 1", id)
+	}
+
+	events, err := log.Query(ctx, QueryFilter{ChainID: testChainID})
+	if err != nil {
+		t.Fatalf("Query via external pool: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("Query via external pool: got %d events, want 1", len(events))
+	}
+}
+
+// TestPostgresAuditLog_SharedPool_CloseDoesNotClosePool is the regression
+// test for ownsPool: an AuditLog built from an externally-supplied Pool
+// must not close that pool on Close() — the pool, and anything else
+// sharing it (here, a second AuditLog instance), must remain usable
+// afterward. Mirrors grnoti's own
+// TestPostgresStores_SharedPool_CloseDoesNotAffectSiblingStore.
+func TestPostgresAuditLog_SharedPool_CloseDoesNotClosePool(t *testing.T) {
+	truncatePostgresTestDB()
+	ctx := context.Background()
+
+	pool, err := pgxpool.New(ctx, postgresTestDSN)
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+
+	log1, err := NewPostgresAuditLog(PostgresConfig{Pool: pool})
+	if err != nil {
+		t.Fatalf("NewPostgresAuditLog(Pool: pool) [1st]: %v", err)
+	}
+	log2, err := NewPostgresAuditLog(PostgresConfig{Pool: pool})
+	if err != nil {
+		t.Fatalf("NewPostgresAuditLog(Pool: pool) [2nd]: %v", err)
+	}
+
+	if err := log1.Close(); err != nil {
+		t.Fatalf("log1.Close(): %v", err)
+	}
+
+	// The shared pool, and the sibling AuditLog still using it, must
+	// remain usable after log1.Close() — proving Close() didn't close a
+	// pool it doesn't own.
+	if _, err := log2.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+		t.Fatalf("Record on log2 after log1.Close(): %v", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("pool.Ping() after log1.Close(): %v, want the shared pool to still be open", err)
+	}
+
+	_ = log2.Close()
+}
+
 func TestPostgresSchemaApplyIsIdempotent(t *testing.T) {
 	log1, err := newPostgresLog()
 	if err != nil {
