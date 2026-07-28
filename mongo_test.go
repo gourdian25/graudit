@@ -63,7 +63,7 @@ func newMongoLogWithBus(bus *stubBus) (AuditLog, error) {
 // tamperMongoEntry bypasses the AuditLog interface entirely via a raw
 // driver update against the same test database, simulating an attacker or
 // a bug elsewhere touching the collection directly.
-func tamperMongoEntry(t *testing.T, log AuditLog, entryID EntryID) {
+func tamperMongoEntry(t *testing.T, log AuditLog, chainID string, entryID EntryID) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -74,7 +74,7 @@ func tamperMongoEntry(t *testing.T, log AuditLog, entryID EntryID) {
 	defer client.Disconnect(ctx)
 
 	coll := client.Database(mongoTestDatabase).Collection("graudit_entries")
-	res, err := coll.UpdateOne(ctx, bson.M{"entryId": uint64(entryID)}, bson.M{"$set": bson.M{"payload": []byte(`{"tampered":true}`)}})
+	res, err := coll.UpdateOne(ctx, bson.M{"chainId": chainID, "entryId": uint64(entryID)}, bson.M{"$set": bson.M{"payload": []byte(`{"tampered":true}`)}})
 	if err != nil {
 		t.Fatalf("tamper UpdateOne: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestNewMongoAuditLog_CustomCollectionAndLogger(t *testing.T) {
 	}
 	defer log.Close()
 
-	if _, err := log.Record(context.Background(), AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+	if _, err := log.Record(context.Background(), AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 		t.Fatalf("Record against custom collection: %v", err)
 	}
 }
@@ -146,7 +146,7 @@ func TestMongoAuditLog_RecordChange_InvalidPayload(t *testing.T) {
 	}
 	defer log.Close()
 
-	if _, err := log.RecordChange(context.Background(), "actor:1", "widget", "w1", make(chan int), nil); !errors.Is(err, ErrInvalidEvent) {
+	if _, err := log.RecordChange(context.Background(), testChainID, "actor:1", "widget", "w1", make(chan int), nil); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("RecordChange with an unmarshalable before value: err=%v, want ErrInvalidEvent", err)
 	}
 }
@@ -159,7 +159,7 @@ func TestMongoAuditLog_Query_InvalidStoredPayload(t *testing.T) {
 	defer log.Close()
 
 	ctx := context.Background()
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
@@ -169,14 +169,14 @@ func TestMongoAuditLog_Query_InvalidStoredPayload(t *testing.T) {
 	}
 	defer client.Disconnect(ctx)
 	coll := client.Database(mongoTestDatabase).Collection("graudit_entries")
-	if _, err := coll.UpdateOne(ctx, bson.M{"entryId": uint64(1)}, bson.M{"$set": bson.M{"payload": []byte(`not-valid-json`)}}); err != nil {
+	if _, err := coll.UpdateOne(ctx, bson.M{"chainId": testChainID, "entryId": uint64(1)}, bson.M{"$set": bson.M{"payload": []byte(`not-valid-json`)}}); err != nil {
 		t.Fatalf("corrupt payload: %v", err)
 	}
 
-	if _, err := log.Query(ctx, QueryFilter{}); err == nil {
+	if _, err := log.Query(ctx, QueryFilter{ChainID: testChainID}); err == nil {
 		t.Fatal("expected Query to surface a decode error for a corrupted payload, got nil")
 	}
-	if _, _, err := log.Verify(ctx, 1, 1); err == nil {
+	if _, _, err := log.Verify(ctx, testChainID, 1, 1); err == nil {
 		t.Fatal("expected Verify to surface a decode error for a corrupted payload, got nil")
 	}
 }

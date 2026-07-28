@@ -43,6 +43,59 @@ a hash chain only detects partial tampering, not wholesale regeneration by
 someone who controls the storage. Don't let "tamper-evident" read as
 "cryptographically un-forgeable."
 
+## How it works
+
+Every `Record`/`RecordChange` call reads the current tail of the entry's
+`ChainID` (its last stored `Hash` and `EntryID`, or the genesis values if
+the chain is empty), computes a new `Hash` over the entry's own fields plus
+that `PrevHash`, and appends the entry — under a backend-specific
+serialization mechanism (a `sync.Mutex` for memory, a
+`pg_advisory_xact_lock` for Postgres, a multi-document ACID transaction for
+Mongo) so concurrent writers on the *same* chain never race on "what's the
+current tail." A best-effort `grevents` publish happens only after the
+durable write succeeds:
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant AuditLog
+    participant Storage as Backend storage
+    participant Bus as grevents.Bus
+
+    Caller->>AuditLog: Record(ctx, event{ChainID, ActorID, ...})
+    AuditLog->>Storage: lock chain, read tail (last Hash + EntryID)
+    Storage-->>AuditLog: PrevHash, lastEntryID (or genesis if empty)
+    AuditLog->>AuditLog: Hash = ComputeHash(ChainID, EntryID, ..., PrevHash)
+    AuditLog->>Storage: insert entry (EntryID, Hash, PrevHash, Payload, ...)
+    Storage-->>AuditLog: committed
+    AuditLog-->>Caller: EntryID
+    AuditLog--)Bus: PublishRecorded (best-effort; a failure here never fails Record)
+```
+
+Each entry's `Hash` links it to the one before it, forming a chain per
+`ChainID`. `Verify(ctx, chainID, from, to)` walks a range and fails at the
+first entry whose stored `Hash` doesn't match one recomputed from its own
+fields (tampering), or whose stored `PrevHash` doesn't match the previous
+entry's stored `Hash` (a deleted or reordered entry):
+
+```mermaid
+flowchart LR
+    G["Genesis\nPrevHash = 0000…0"] -->|PrevHash| E1
+    subgraph Chain["one ChainID's hash chain"]
+        E1["Entry 1\nHash₁ = H(ChainID, 1, fields…, Genesis)"] -->|PrevHash = Hash₁| E2["Entry 2\nHash₂ = H(ChainID, 2, fields…, Hash₁)"]
+        E2 -->|PrevHash = Hash₂| E3["Entry 3\nHash₃ = H(ChainID, 3, fields…, Hash₂)"]
+    end
+    E3 -.->|Verify recomputes each Hash\nand checks each PrevHash| V["Verify(chainID, 1, 3)"]
+```
+
+`ChainID` is the first field baked into every `Hash` — not just a
+storage/filter column — which is what makes one `AuditLog` instance safe
+to share across many independent chains (see
+[Multi-chain support](#multi-chain-support) below): tampering can't move an
+entry from one chain to another without breaking its hash, since chains
+never share a hash namespace even though their `EntryID` sequences both
+start at 1.
+
 ## Install
 
 ```sh
@@ -68,6 +121,7 @@ func main() {
 
 	ctx := context.Background()
 	id, err := auditLog.Record(ctx, graudit.AuditEvent{
+		ChainID:    "tenant:acme",
 		ActorID:    "user:42",
 		EntityType: "invoice",
 		EntityID:   "inv_123",
@@ -81,7 +135,53 @@ func main() {
 ```
 
 See [example/example.go](example/example.go) for a fuller runnable demo
-(`Record`, `RecordChange`, `Verify`, `Query`).
+(`Record`, `RecordChange`, `Verify`, `Query`, two independent chains on one
+`AuditLog` instance).
+
+## Multi-chain support
+
+Every `Record`/`RecordChange`/`Verify`/`Query` call is scoped by a required
+`ChainID`, so one `AuditLog` instance — one connection pool in a networked
+backend — can serve any number of independent hash chains at once: `EntryID`
+sequences and `PrevHash` linkage are tracked per `ChainID`, not globally.
+This is the shape a multi-tenant deployment wants — one chain per tenant,
+plus a separate chain for platform-operator actions — without opening one
+`AuditLog`/connection pool per tenant.
+
+```go
+auditLog.Record(ctx, graudit.AuditEvent{ChainID: "tenant:acme", ActorID: "user:42", /* ... */})
+auditLog.Record(ctx, graudit.AuditEvent{ChainID: "platform:ops", ActorID: "operator:jane", /* ... */})
+
+ok, detail, err := auditLog.Verify(ctx, "tenant:acme", 1, latestID)
+```
+
+```mermaid
+flowchart TB
+    App["Your application\n(e.g. schema-per-tenant SaaS backend)"] --> AL["one graudit.AuditLog\n(one connection pool)"]
+    AL --> C1["ChainID = tenant:acme\nEntryID 1, 2, 3, …"]
+    AL --> C2["ChainID = tenant:globex\nEntryID 1, 2, 3, …"]
+    AL --> C3["ChainID = platform:ops\nEntryID 1, 2, 3, …"]
+    C1 --> S[("shared storage\nPostgres / Mongo / memory")]
+    C2 --> S
+    C3 --> S
+```
+
+Each chain's `EntryID` sequence restarts at 1 independently and its
+`Verify`/`Query` calls never see another chain's rows, even though every
+chain lives in the same underlying table/collection — the isolation comes
+from the mandatory `ChainID` filter plus `ChainID` being part of every
+entry's `Hash`, not from separate storage per chain.
+
+`ChainID` is mandatory everywhere and there is no wildcard/query-all escape
+hatch — an empty `ChainID` fails loud with `graudit.ErrChainIDRequired`
+rather than silently matching every chain, since a cross-tenant leak in an
+audit trail is worse than the ergonomic cost of always specifying one.
+`ChainID` is also baked into every entry's `Hash` (see `ComputeHash`), not
+just stored as a filter column — otherwise an attacker with direct
+database access could splice an entry from one chain into another without
+invalidating its hash, since `EntryID` sequences independently restart at
+1 in every chain. See [docs/architecture.md](docs/architecture.md)'s
+"Multi-chain support" section for the full rationale.
 
 ## Backends
 
@@ -103,6 +203,12 @@ auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	DSN: "host=localhost user=myuser password=mypass dbname=mydb port=5432 sslmode=disable",
 })
 
+// Or share a pool your application already owns — exactly one of DSN or
+// Pool is required. graudit never closes a Pool it didn't dial itself.
+auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
+	Pool: sharedPool, // *pgxpool.Pool
+})
+
 // MongoDB — must be a replica set (single-node is sufficient); construction
 // fails fast otherwise, wrapping graudit.ErrReplicaSetRequired.
 auditLog, err := graudit.NewMongoAuditLog(graudit.MongoConfig{
@@ -117,8 +223,8 @@ graudit used to split Postgres/Mongo/memory into separate importable
 subpackages and used GORM for its Postgres backend. Both changed as part
 of an ecosystem-wide standardization pass: the backends flattened into
 this one root package, and GORM was replaced with `pgx/v5` +
-sqlc-generated queries. See [CHANGELOG.md](CHANGELOG.md)'s `[Unreleased]`
-entry for the full rationale.
+sqlc-generated queries. See [CHANGELOG.md](CHANGELOG.md)'s `[0.3.0]` entry
+for the full rationale.
 
 ## Thread safety
 
@@ -203,7 +309,7 @@ auditLog, err := graudit.NewMemoryAuditLog(graudit.WithLogger(logger))
 ## `Verify()` semantics
 
 ```go
-ok, detail, err := auditLog.Verify(ctx, 1, latestID)
+ok, detail, err := auditLog.Verify(ctx, chainID, 1, latestID)
 if err != nil {
 	// operational failure — could not even attempt verification
 }
@@ -230,7 +336,7 @@ make docker-up   # starts the shared Postgres/Mongo(auth)/Mongo(standalone) test
 make docker-down # stops them when you're done
 ```
 
-The root package maintains 95.2% test coverage, enforced by a 95% gate
+The root package maintains 95.5% test coverage, enforced by a 95% gate
 (`make coverage-check`).
 
 The primary Mongo container is an authenticated single-node replica set —
@@ -251,19 +357,22 @@ make race               # go test -race ./...  (mandatory before any change touc
 make coverage-check       # verify the root package meets 95%
 ```
 
-`make bench` (`go test -bench=. -benchmem -benchtime=10s ./...`) is also
-defined in the Makefile, but there are currently no `Benchmark*` functions
-anywhere in this repo — running it builds and passes without executing any
-benchmark or producing timing numbers. Treat it as reserved for when
-microbenchmarks are added, not as a working target today.
+`make bench` (`go test -bench=. -benchmem -benchtime=10s ./...`) runs this
+repo's one `Benchmark*` function,
+`BenchmarkPostgresAuditLog_Record_ChainConcurrency` (requires a live
+Postgres), comparing concurrent `Record` throughput on one shared chain
+against many independent chains — a manually-inspected comparison
+demonstrating the advisory-lock chain-scoping in
+[docs/architecture.md](docs/architecture.md), not a CI-gated assertion.
 
 A shared contract test suite (`contract_audit_test.go`, run via
 `TestAuditLog_Contract`'s per-backend subtests) runs one behavioral suite
 (hash-chain integrity, concurrent-write ordering, deliberate-tamper
-detection, hash determinism, grevents publish/publish-failure) against all
-three backends through the `AuditLog` interface — folded from a standalone
-`conformance` package into the root package's own tests, matching the rest
-of the gourdian ecosystem's convention.
+detection, hash determinism, grevents publish/publish-failure, multi-chain
+isolation and tamper containment) against all three backends through the
+`AuditLog` interface — folded from a standalone `conformance` package into
+the root package's own tests, matching the rest of the gourdian
+ecosystem's convention.
 
 ## Out of scope (v1)
 

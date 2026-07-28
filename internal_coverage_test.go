@@ -56,6 +56,84 @@ func TestPostgresAuditLog_Record_InvalidEvent(t *testing.T) {
 	}
 }
 
+// TestMemoryAuditLog_Verify_EmptyChainID, TestPostgresAuditLog_Verify_EmptyChainID,
+// TestMongoAuditLog_Verify_EmptyChainID, and their Query counterparts below
+// cover each backend's own empty-chainID validation branch directly — the
+// shared contract suite never calls Verify/Query with an empty chainID
+// (every scenario uses testChainID), so these branches are only reachable
+// via a direct call bypassing that.
+func TestMemoryAuditLog_Verify_EmptyChainID(t *testing.T) {
+	log, err := NewMemoryAuditLog()
+	if err != nil {
+		t.Fatalf("NewMemoryAuditLog: %v", err)
+	}
+	defer log.Close()
+
+	if _, _, err := log.Verify(context.Background(), "", 1, 1); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("Verify with an empty chainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
+func TestMemoryAuditLog_Query_EmptyChainID(t *testing.T) {
+	log, err := NewMemoryAuditLog()
+	if err != nil {
+		t.Fatalf("NewMemoryAuditLog: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.Query(context.Background(), QueryFilter{}); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("Query with an empty ChainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
+func TestPostgresAuditLog_Verify_EmptyChainID(t *testing.T) {
+	log, err := newPostgresLog()
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer log.Close()
+
+	if _, _, err := log.Verify(context.Background(), "", 1, 1); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("Verify with an empty chainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
+func TestPostgresAuditLog_Query_EmptyChainID(t *testing.T) {
+	log, err := newPostgresLog()
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.Query(context.Background(), QueryFilter{}); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("Query with an empty ChainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
+func TestMongoAuditLog_Verify_EmptyChainID(t *testing.T) {
+	log, err := newMongoLog()
+	if err != nil {
+		t.Skipf("MongoDB not available, skipping: %v", err)
+	}
+	defer log.Close()
+
+	if _, _, err := log.Verify(context.Background(), "", 1, 1); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("Verify with an empty chainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
+func TestMongoAuditLog_Query_EmptyChainID(t *testing.T) {
+	log, err := newMongoLog()
+	if err != nil {
+		t.Skipf("MongoDB not available, skipping: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.Query(context.Background(), QueryFilter{}); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("Query with an empty ChainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
 func TestMongoAuditLog_Record_InvalidEvent(t *testing.T) {
 	log, err := newMongoLog()
 	if err != nil {
@@ -76,11 +154,11 @@ func TestMemoryAuditLog_Verify_ClampsFromBelowOne(t *testing.T) {
 	defer log.Close()
 
 	ctx := context.Background()
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
-	ok, _, err := log.Verify(ctx, 0, 1)
+	ok, _, err := log.Verify(ctx, testChainID, 0, 1)
 	if err != nil {
 		t.Fatalf("Verify(0, 1): %v", err)
 	}
@@ -96,7 +174,7 @@ func TestMemoryAuditLog_RecordChange_InvalidPayload(t *testing.T) {
 	}
 	defer log.Close()
 
-	if _, err := log.RecordChange(context.Background(), "actor:1", "widget", "w1", make(chan int), nil); !errors.Is(err, ErrInvalidEvent) {
+	if _, err := log.RecordChange(context.Background(), testChainID, "actor:1", "widget", "w1", make(chan int), nil); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("RecordChange with an unmarshalable before value: err=%v, want ErrInvalidEvent", err)
 	}
 }
@@ -118,7 +196,7 @@ func TestMemoryAuditLog_VerifyDetectsChainLinkageBreak(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
-		if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+		if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 			t.Fatalf("Record #%d: %v", i, err)
 		}
 	}
@@ -128,7 +206,7 @@ func TestMemoryAuditLog_VerifyDetectsChainLinkageBreak(t *testing.T) {
 	a.entries[1].PrevHash = GenesisPrevHash
 	a.mu.Unlock()
 
-	ok, detail, err := log.Verify(ctx, 1, 3)
+	ok, detail, err := log.Verify(ctx, testChainID, 1, 3)
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
@@ -149,7 +227,7 @@ func TestPostgresAuditLog_VerifyDetectsChainLinkageBreak(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
-		if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+		if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 			t.Fatalf("Record #%d: %v", i, err)
 		}
 	}
@@ -159,11 +237,11 @@ func TestPostgresAuditLog_VerifyDetectsChainLinkageBreak(t *testing.T) {
 		t.Fatalf("pgxpool.New: %v", err)
 	}
 	defer pool.Close()
-	if _, err := pool.Exec(ctx, `UPDATE graudit_entries SET prev_hash = $1 WHERE entry_id = 2`, GenesisPrevHash); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE graudit_entries SET prev_hash = $1 WHERE chain_id = $2 AND entry_id = 2`, GenesisPrevHash, testChainID); err != nil {
 		t.Fatalf("tamper prev_hash: %v", err)
 	}
 
-	ok, detail, err := log.Verify(ctx, 1, 3)
+	ok, detail, err := log.Verify(ctx, testChainID, 1, 3)
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
@@ -184,7 +262,7 @@ func TestMongoAuditLog_VerifyDetectsChainLinkageBreak(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
-		if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+		if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 			t.Fatalf("Record #%d: %v", i, err)
 		}
 	}
@@ -195,12 +273,12 @@ func TestMongoAuditLog_VerifyDetectsChainLinkageBreak(t *testing.T) {
 	}
 	defer client.Disconnect(ctx)
 	coll := client.Database(mongoTestDatabase).Collection("graudit_entries")
-	if _, err := coll.UpdateOne(ctx, bson.M{"entryId": uint64(2)},
+	if _, err := coll.UpdateOne(ctx, bson.M{"chainId": testChainID, "entryId": uint64(2)},
 		bson.M{"$set": bson.M{"prevHash": GenesisPrevHash}}); err != nil {
 		t.Fatalf("tamper prevHash: %v", err)
 	}
 
-	ok, detail, err := log.Verify(ctx, 1, 3)
+	ok, detail, err := log.Verify(ctx, testChainID, 1, 3)
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
@@ -242,7 +320,7 @@ func TestPostgresAuditLog_Record_TableDroppedMidFlight(t *testing.T) {
 		}
 	}()
 
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Record with the table dropped mid-flight: err=%v, want ErrBackendUnavailable", err)
 	}
 }
@@ -277,7 +355,7 @@ func TestPostgresAuditLog_Record_InsertRejectedByCheckConstraint(t *testing.T) {
 		}
 	}()
 
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Record with insert rejected by a CHECK constraint: err=%v, want ErrBackendUnavailable", err)
 	}
 }
@@ -314,16 +392,16 @@ func TestPostgresAuditLog_OperationsAfterPoolClosed(t *testing.T) {
 	a.pool.Close()
 
 	ctx := context.Background()
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Record after pool closed: err=%v, want ErrBackendUnavailable", err)
 	}
-	if _, err := log.RecordChange(ctx, "a", "t", "1", nil, map[string]any{"x": 1}); !errors.Is(err, ErrBackendUnavailable) {
+	if _, err := log.RecordChange(ctx, testChainID, "a", "t", "1", nil, map[string]any{"x": 1}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("RecordChange after pool closed: err=%v, want ErrBackendUnavailable", err)
 	}
-	if _, _, err := log.Verify(ctx, 1, 1); !errors.Is(err, ErrBackendUnavailable) {
+	if _, _, err := log.Verify(ctx, testChainID, 1, 1); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Verify after pool closed: err=%v, want ErrBackendUnavailable", err)
 	}
-	if _, err := log.Query(ctx, QueryFilter{}); !errors.Is(err, ErrBackendUnavailable) {
+	if _, err := log.Query(ctx, QueryFilter{ChainID: testChainID}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Query after pool closed: err=%v, want ErrBackendUnavailable", err)
 	}
 	// Close itself is still safe to call (idempotent via sync.Once) even
@@ -348,16 +426,16 @@ func TestMongoAuditLog_OperationsAfterClientDisconnected(t *testing.T) {
 		t.Fatalf("Disconnect: %v", err)
 	}
 
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Record after client disconnected: err=%v, want ErrBackendUnavailable", err)
 	}
-	if _, err := log.RecordChange(ctx, "a", "t", "1", nil, map[string]any{"x": 1}); !errors.Is(err, ErrBackendUnavailable) {
+	if _, err := log.RecordChange(ctx, testChainID, "a", "t", "1", nil, map[string]any{"x": 1}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("RecordChange after client disconnected: err=%v, want ErrBackendUnavailable", err)
 	}
-	if _, _, err := log.Verify(ctx, 1, 1); !errors.Is(err, ErrBackendUnavailable) {
+	if _, _, err := log.Verify(ctx, testChainID, 1, 1); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Verify after client disconnected: err=%v, want ErrBackendUnavailable", err)
 	}
-	if _, err := log.Query(ctx, QueryFilter{}); !errors.Is(err, ErrBackendUnavailable) {
+	if _, err := log.Query(ctx, QueryFilter{ChainID: testChainID}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Query after client disconnected: err=%v, want ErrBackendUnavailable", err)
 	}
 }
@@ -384,8 +462,8 @@ func TestNewMongoAuditLog_EnsureIndexesFailsOnDuplicateEntryID(t *testing.T) {
 	const collection = "dup_entry_id_entries"
 	coll := client.Database(mongoTestDatabase).Collection(collection)
 	if _, err := coll.InsertMany(ctx, []interface{}{
-		entryDocument{EntryID: 1, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create", Hash: "h1", PrevHash: GenesisPrevHash},
-		entryDocument{EntryID: 1, ActorID: "a", EntityType: "t", EntityID: "2", Action: "create", Hash: "h2", PrevHash: "h1"},
+		entryDocument{ChainID: testChainID, EntryID: 1, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create", Hash: "h1", PrevHash: GenesisPrevHash},
+		entryDocument{ChainID: testChainID, EntryID: 1, ActorID: "a", EntityType: "t", EntityID: "2", Action: "create", Hash: "h2", PrevHash: "h1"},
 	}); err != nil {
 		t.Fatalf("seed duplicate entryId docs: %v", err)
 	}
@@ -414,7 +492,7 @@ func TestMongoAuditLog_Record_ChainStateReplaceRejectedByValidator(t *testing.T)
 	ctx := context.Background()
 	// Record once so the chain-state collection already exists — collMod
 	// below requires an existing collection.
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 		t.Fatalf("seed Record: %v", err)
 	}
 
@@ -439,7 +517,7 @@ func TestMongoAuditLog_Record_ChainStateReplaceRejectedByValidator(t *testing.T)
 		}).Err()
 	}()
 
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "2", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "2", Action: "create"}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Record with chain-state ReplaceOne rejected by validator: err=%v, want ErrBackendUnavailable", err)
 	}
 }
@@ -468,13 +546,13 @@ func TestPostgresAuditLog_Verify_ClampsFromBelowOne(t *testing.T) {
 	defer log.Close()
 
 	ctx := context.Background()
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
 	// from=0 must clamp to 1, matching every other backend's documented
 	// behavior (EntryID is 1-based; there is no entry #0).
-	ok, _, err := log.Verify(ctx, 0, 1)
+	ok, _, err := log.Verify(ctx, testChainID, 0, 1)
 	if err != nil {
 		t.Fatalf("Verify(0, 1): %v", err)
 	}
@@ -491,11 +569,11 @@ func TestMongoAuditLog_Verify_ClampsFromBelowOne(t *testing.T) {
 	defer log.Close()
 
 	ctx := context.Background()
-	if _, err := log.Record(ctx, AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 
-	ok, _, err := log.Verify(ctx, 0, 1)
+	ok, _, err := log.Verify(ctx, testChainID, 0, 1)
 	if err != nil {
 		t.Fatalf("Verify(0, 1): %v", err)
 	}
@@ -520,7 +598,7 @@ func TestPostgresAuditLog_ConfigTuning(t *testing.T) {
 	}
 	defer log.Close()
 
-	if _, err := log.Record(context.Background(), AuditEvent{ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+	if _, err := log.Record(context.Background(), AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 }

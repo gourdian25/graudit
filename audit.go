@@ -18,10 +18,14 @@ import (
 // determinism bug this package exists to prevent.
 var GenesisPrevHash = strings.Repeat("0", 64)
 
-// EntryID is a chain position: strictly increasing starting at 1, never a
-// UUID. Backends assign it explicitly (never via a database auto-increment
-// sequence — see each backend's doc comment for why) so that "no gaps" is
-// an invariant Verify() can rely on.
+// EntryID is a position within one chain: strictly increasing starting at
+// 1, never a UUID. EntryID is unique only together with the ChainID it was
+// assigned under — two different chains each independently start their own
+// EntryID sequence at 1, so an EntryID alone never identifies an entry
+// across an entire AuditLog instance. Backends assign it explicitly (never
+// via a database auto-increment sequence — see each backend's doc comment
+// for why) so that "no gaps within a chain" is an invariant Verify() can
+// rely on.
 type EntryID uint64
 
 // AuditLog is the primary interface all backends implement. Every backend
@@ -39,14 +43,17 @@ type AuditLog interface {
 	//
 	// Parameters:
 	//   - ctx: context.Context
-	//   - event: AuditEvent — ActorID, EntityType, EntityID, and Action are
-	//     required; ID, Hash, PrevHash are set by Record and any input
-	//     value is ignored; Timestamp defaults to time.Now() if zero
+	//   - event: AuditEvent — ChainID, ActorID, EntityType, EntityID, and
+	//     Action are required; ID, Hash, PrevHash are set by Record and any
+	//     input value is ignored; Timestamp defaults to time.Now() if zero
 	//
 	// Returns:
-	//   - EntryID: the newly assigned, strictly-sequential chain position
+	//   - EntryID: the newly assigned, strictly-sequential position within
+	//     event.ChainID (not globally unique across chains — see EntryID's
+	//     own doc comment)
 	//   - error: wraps ErrInvalidEvent for a missing required field or a
-	//     non-JSON-serializable Payload, ErrClosed if called after Close,
+	//     non-JSON-serializable Payload (ChainID additionally wraps
+	//     ErrChainIDRequired), ErrClosed if called after Close,
 	//     ErrBackendUnavailable for a storage failure
 	Record(ctx context.Context, event AuditEvent) (EntryID, error)
 
@@ -58,6 +65,7 @@ type AuditLog interface {
 	//
 	// Parameters:
 	//   - ctx: context.Context
+	//   - chainID: string — required; the chain this entry belongs to
 	//   - actorID, entityType, entityID: string — all required, same as AuditEvent
 	//   - before, after: any — JSON-serializable snapshots of the entity's
 	//     state; either may be nil (nil before means "creation", nil after
@@ -65,40 +73,48 @@ type AuditLog interface {
 	//
 	// Returns:
 	//   - EntryID: see Record
-	//   - error: see Record, plus any error from computing the diff itself
+	//   - error: see Record (an empty chainID wraps ErrChainIDRequired,
+	//     not ErrInvalidEvent — this is a direct parameter, not a missing
+	//     AuditEvent field), plus any error from computing the diff itself
 	//     (a before/after value that cannot be marshaled to a JSON object)
-	RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error)
+	RecordChange(ctx context.Context, chainID, actorID, entityType, entityID string, before, after any) (EntryID, error)
 
-	// Verify recomputes the hash chain across [from, to] (inclusive) and
-	// confirms integrity via two checks per entry: that each entry's stored
-	// Hash matches one recomputed from its own stored fields, and that each
-	// entry's stored PrevHash matches the immediately preceding entry's
-	// stored Hash. ok=false (with a non-nil detail, no error) means
-	// tampering or corruption was detected; err is reserved for genuine
-	// operational failures (e.g. can't reach the backend).
+	// Verify recomputes the hash chain across [from, to] (inclusive),
+	// scoped to one chainID, and confirms integrity via two checks per
+	// entry: that each entry's stored Hash matches one recomputed from its
+	// own stored fields, and that each entry's stored PrevHash matches the
+	// immediately preceding entry's stored Hash. ok=false (with a non-nil
+	// detail, no error) means tampering or corruption was detected; err is
+	// reserved for genuine operational failures (e.g. can't reach the
+	// backend).
 	//
 	// Parameters:
 	//   - ctx: context.Context
-	//   - from, to: EntryID — inclusive range; from must be >= 1
+	//   - chainID: string — required; from/to are positions within this
+	//     chain only, never across chains
+	//   - from, to: EntryID — inclusive range within chainID; from must be >= 1
 	//
 	// Returns:
 	//   - ok: bool — true if every entry in range passes both checks
 	//   - detail: VerifyResult — see its own doc comment
-	//   - err: error — non-nil only for an operational failure, never for
-	//     detected tampering (that is reported via detail, with ok=false)
-	Verify(ctx context.Context, from, to EntryID) (ok bool, detail VerifyResult, err error)
+	//   - err: error — non-nil for an operational failure or an empty
+	//     chainID (wraps ErrChainIDRequired), never for detected tampering
+	//     (that is reported via detail, with ok=false)
+	Verify(ctx context.Context, chainID string, from, to EntryID) (ok bool, detail VerifyResult, err error)
 
 	// Query returns entries matching filter, ordered oldest-first.
 	//
 	// Parameters:
 	//   - ctx: context.Context
-	//   - filter: QueryFilter — zero value matches every entry, subject to
-	//     Limit (0 means no limit)
+	//   - filter: QueryFilter — ChainID is required (unlike every other
+	//     field, whose zero value means "don't filter on this"); Limit 0
+	//     means no limit
 	//
 	// Returns:
 	//   - []AuditEvent: entries matching filter, oldest-first
-	//   - error: ErrClosed if called after Close, ErrBackendUnavailable for
-	//     a storage failure
+	//   - error: wraps ErrChainIDRequired for an empty filter.ChainID,
+	//     ErrClosed if called after Close, ErrBackendUnavailable for a
+	//     storage failure
 	Query(ctx context.Context, filter QueryFilter) ([]AuditEvent, error)
 
 	// Close releases any underlying connections/resources. After Close,
@@ -106,10 +122,19 @@ type AuditLog interface {
 	Close() error
 }
 
-// AuditEvent is a single entry in the chain.
+// AuditEvent is a single entry in a chain.
 type AuditEvent struct {
-	// ID is this entry's chain position. Set by Record; any input value is
-	// ignored.
+	// ChainID identifies which independent chain this entry belongs to
+	// (e.g. a tenant ID, or a fixed identifier like "platform" for
+	// operator-level actions outside any tenant). Required — graudit never
+	// treats an empty ChainID as an implicit default chain. One AuditLog
+	// instance can serve any number of chains; EntryID sequences,
+	// PrevHash linkage, and Verify are all scoped to one ChainID
+	// independently of every other chain sharing the same instance.
+	ChainID string
+
+	// ID is this entry's position within ChainID. Set by Record; any input
+	// value is ignored.
 	ID EntryID
 
 	// ActorID identifies who performed the action. Required. graudit does
@@ -151,6 +176,8 @@ type AuditEvent struct {
 // independently.
 func (e AuditEvent) Validate() error {
 	switch {
+	case e.ChainID == "":
+		return fmt.Errorf("%w: %w: ChainID is required", ErrInvalidEvent, ErrChainIDRequired)
 	case e.ActorID == "":
 		return fmt.Errorf("%w: ActorID is required", ErrInvalidEvent)
 	case e.EntityType == "":
@@ -168,9 +195,14 @@ func (e AuditEvent) Validate() error {
 	return nil
 }
 
-// QueryFilter selects entries for Query. The zero value matches every
-// entry. Any combination of fields may be set together.
+// QueryFilter selects entries for Query. Unlike every other field (whose
+// zero value means "don't filter on this"), ChainID is required — Query
+// returns ErrChainIDRequired for an empty ChainID rather than matching
+// every chain, since silently returning every tenant's entries would be a
+// cross-chain data leak. Any combination of the other fields may be set
+// together.
 type QueryFilter struct {
+	ChainID    string
 	ActorID    string
 	EntityType string
 	EntityID   string

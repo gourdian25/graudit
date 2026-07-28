@@ -21,6 +21,16 @@ var (
 	// required field or has a Payload that cannot be JSON-marshaled.
 	ErrInvalidEvent = errors.New("graudit: invalid audit event")
 
+	// ErrChainIDRequired indicates a chain identifier was missing: an empty
+	// AuditEvent.ChainID passed to Record (wrapped together with
+	// ErrInvalidEvent, so errors.Is matches either sentinel regardless of
+	// which method caught it), an empty chainID passed directly to
+	// RecordChange/Verify, or an empty QueryFilter.ChainID passed to Query.
+	// graudit never treats an empty ChainID as an implicit "default" or
+	// "global" chain — doing so would risk one tenant's entries silently
+	// landing in, or a query silently returning, another tenant's chain.
+	ErrChainIDRequired = errors.New("graudit: ChainID is required")
+
 	// ErrEntryNotFound indicates a query for a specific entry found none.
 	ErrEntryNotFound = errors.New("graudit: entry not found")
 

@@ -26,10 +26,15 @@
 //
 //   - A single AuditLog interface: Record, RecordChange, Verify, Query,
 //     Close — implemented identically by all three backends
-//   - Hash-chained entries: each entry's Hash covers its own fields plus
-//     the previous entry's Hash (see ComputeHash)
-//   - Verify(from, to) recomputes the chain across a range and reports the
-//     first broken link, if any, via VerifyResult
+//   - Multi-chain: every call is scoped by a required ChainID, so one
+//     AuditLog instance (one connection pool) can serve any number of
+//     independent hash chains — e.g. one per tenant in a multi-tenant
+//     deployment, plus a separate chain for platform-operator actions
+//   - Hash-chained entries: each entry's Hash covers its own fields
+//     (including ChainID, so an entry can't be spliced from one chain into
+//     another) plus the previous entry's Hash (see ComputeHash)
+//   - Verify(chainID, from, to) recomputes one chain across a range and
+//     reports the first broken link, if any, via VerifyResult
 //   - RecordChange diffs a before/after pair and stores the diff as the
 //     entry's Payload (see ChangeDiff)
 //   - Publishes one grevents event (TopicAuditRecorded) per successful
@@ -60,6 +65,7 @@
 //
 //		ctx := context.Background()
 //		id, err := log_.Record(ctx, graudit.AuditEvent{
+//			ChainID:    "tenant:acme",
 //			ActorID:    "user:42",
 //			EntityType: "invoice",
 //			EntityID:   "inv_123",
@@ -70,6 +76,24 @@
 //		}
 //		log.Println("recorded entry", id)
 //	}
+//
+// # Multi-chain Support
+//
+// ChainID scopes every Record/RecordChange/Verify/Query call to one
+// independent hash chain — EntryID sequences and PrevHash linkage are
+// tracked per ChainID, not globally, so one AuditLog instance backed by one
+// connection pool can serve any number of chains simultaneously (e.g. one
+// per tenant in a multi-tenant deployment). ChainID is mandatory
+// everywhere and there is no wildcard/query-all escape hatch: an empty
+// ChainID fails loud with ErrChainIDRequired rather than silently matching
+// every chain, since a cross-tenant leak in an audit trail is worse than
+// the ergonomic cost of always specifying one. See
+// docs/architecture.md's "Multi-chain support" section for why ChainID
+// must be part of the hash preimage, not just a storage/filter column.
+//
+//	log_.Record(ctx, graudit.AuditEvent{ChainID: "tenant:acme", ...})
+//	log_.Record(ctx, graudit.AuditEvent{ChainID: "platform:ops", ...})
+//	ok, detail, err := log_.Verify(ctx, "tenant:acme", 1, latestID)
 //
 // # Backends
 //
@@ -92,13 +116,19 @@
 //
 //  2. PostgreSQL (NewPostgresAuditLog) — production-eligible, durable. Uses
 //     pgx/v5 with sqlc-generated queries (no ORM). Chain serialization is a
-//     pg_advisory_xact_lock held for the duration of the transaction that
-//     reads the tail and inserts the new entry; EntryID is explicitly
-//     assigned inside that transaction, never a BIGSERIAL column (a
-//     sequence advances even on rollback, which would silently create an
-//     EntryID gap — see docs/architecture.md).
+//     pg_advisory_xact_lock scoped to (a fixed namespace, a per-ChainID
+//     hash) and held for the duration of the transaction that reads the
+//     tail and inserts the new entry, so unrelated chains' writes don't
+//     serialize against each other; EntryID is explicitly assigned inside
+//     that transaction, never a BIGSERIAL column (a sequence advances even
+//     on rollback, which would silently create an EntryID gap — see
+//     docs/architecture.md). PostgresConfig accepts either DSN (dials its
+//     own pool) or an already-open Pool (shares one your application
+//     already owns, e.g. across hundreds of tenant chains) — exactly one
+//     of the two is required.
 //
 //     log_, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{DSN: dsn})
+//     log_, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{Pool: sharedPool})
 //
 //  3. MongoDB (NewMongoAuditLog) — production-eligible, durable. Uses
 //     go.mongodb.org/mongo-driver v1. Chain serialization is a
@@ -140,7 +170,7 @@
 //
 // # Verify() Semantics
 //
-//	ok, detail, err := log_.Verify(ctx, 1, latestID)
+//	ok, detail, err := log_.Verify(ctx, chainID, 1, latestID)
 //	if err != nil {
 //		// operational failure — could not even attempt verification
 //	}

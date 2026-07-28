@@ -29,9 +29,9 @@ func (b *stubBus) Publish(ctx context.Context, event grevents.Event) error {
 func (b *stubBus) Subscribe(topic string, handler grevents.HandlerFunc, opts ...grevents.SubscribeOption) (grevents.Unsubscribe, error) {
 	return func() {}, nil
 }
-func (b *stubBus) Use(mw grevents.Middleware)                       {}
+func (b *stubBus) Use(mw grevents.Middleware)                        {}
 func (b *stubBus) Stats(ctx context.Context) (grevents.Stats, error) { return grevents.Stats{}, nil }
-func (b *stubBus) Close() error                                     { return nil }
+func (b *stubBus) Close() error                                      { return nil }
 
 func (b *stubBus) count() int {
 	b.mu.Lock()
@@ -49,12 +49,12 @@ var _ grevents.Bus = (*stubBus)(nil)
 
 func TestPublishRecorded_NilBusIsNoOp(t *testing.T) {
 	// Must not panic with a nil bus.
-	PublishRecorded(context.Background(), nil, NopLogger(), AuditEvent{ID: 1})
+	PublishRecorded(context.Background(), nil, NopLogger(), AuditEvent{ChainID: testChainID, ID: 1})
 }
 
 func TestPublishRecorded_PublishesExpectedTopicAndPayload(t *testing.T) {
 	bus := &stubBus{}
-	entry := AuditEvent{ID: 1, ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Hash: "h"}
+	entry := AuditEvent{ChainID: testChainID, ID: 1, ActorID: "actor:1", EntityType: "widget", EntityID: "w1", Hash: "h"}
 
 	PublishRecorded(context.Background(), bus, NopLogger(), entry)
 
@@ -72,7 +72,7 @@ func TestPublishRecorded_PublishesExpectedTopicAndPayload(t *testing.T) {
 	if payload.ID != entry.ID || payload.Hash != entry.Hash {
 		t.Fatalf("Payload = %+v, want %+v", payload, entry)
 	}
-	if got.Metadata["actor_id"] != "actor:1" || got.Metadata["entity_type"] != "widget" || got.Metadata["entity_id"] != "w1" {
+	if got.Metadata["chain_id"] != testChainID || got.Metadata["actor_id"] != "actor:1" || got.Metadata["entity_type"] != "widget" || got.Metadata["entity_id"] != "w1" {
 		t.Fatalf("unexpected Metadata: %+v", got.Metadata)
 	}
 }

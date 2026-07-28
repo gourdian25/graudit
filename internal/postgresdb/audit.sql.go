@@ -14,15 +14,16 @@ import (
 
 const getLastEntry = `-- name: GetLastEntry :one
 
-SELECT entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash
-FROM graudit_entries ORDER BY entry_id DESC LIMIT 1
+SELECT chain_id, entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash
+FROM graudit_entries WHERE chain_id = $1 ORDER BY entry_id DESC LIMIT 1
 `
 
 // File: internal/postgresdb/queries/audit.sql
-func (q *Queries) GetLastEntry(ctx context.Context) (GrauditEntry, error) {
-	row := q.db.QueryRow(ctx, getLastEntry)
+func (q *Queries) GetLastEntry(ctx context.Context, chainID string) (GrauditEntry, error) {
+	row := q.db.QueryRow(ctx, getLastEntry, chainID)
 	var i GrauditEntry
 	err := row.Scan(
+		&i.ChainID,
 		&i.EntryID,
 		&i.ActorID,
 		&i.EntityType,
@@ -37,11 +38,12 @@ func (q *Queries) GetLastEntry(ctx context.Context) (GrauditEntry, error) {
 }
 
 const insertEntry = `-- name: InsertEntry :exec
-INSERT INTO graudit_entries (entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+INSERT INTO graudit_entries (chain_id, entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 `
 
 type InsertEntryParams struct {
+	ChainID    string             `db:"chain_id" json:"chain_id"`
 	EntryID    int64              `db:"entry_id" json:"entry_id"`
 	ActorID    string             `db:"actor_id" json:"actor_id"`
 	EntityType string             `db:"entity_type" json:"entity_type"`
@@ -55,6 +57,7 @@ type InsertEntryParams struct {
 
 func (q *Queries) InsertEntry(ctx context.Context, arg InsertEntryParams) error {
 	_, err := q.db.Exec(ctx, insertEntry,
+		arg.ChainID,
 		arg.EntryID,
 		arg.ActorID,
 		arg.EntityType,
@@ -69,19 +72,20 @@ func (q *Queries) InsertEntry(ctx context.Context, arg InsertEntryParams) error 
 }
 
 const listEntriesInRange = `-- name: ListEntriesInRange :many
-SELECT entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash
+SELECT chain_id, entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash
 FROM graudit_entries
-WHERE entry_id >= $1 AND entry_id <= $2
+WHERE chain_id = $1 AND entry_id >= $2 AND entry_id <= $3
 ORDER BY entry_id ASC
 `
 
 type ListEntriesInRangeParams struct {
-	FromID int64 `db:"from_id" json:"from_id"`
-	ToID   int64 `db:"to_id" json:"to_id"`
+	ChainID string `db:"chain_id" json:"chain_id"`
+	FromID  int64  `db:"from_id" json:"from_id"`
+	ToID    int64  `db:"to_id" json:"to_id"`
 }
 
 func (q *Queries) ListEntriesInRange(ctx context.Context, arg ListEntriesInRangeParams) ([]GrauditEntry, error) {
-	rows, err := q.db.Query(ctx, listEntriesInRange, arg.FromID, arg.ToID)
+	rows, err := q.db.Query(ctx, listEntriesInRange, arg.ChainID, arg.FromID, arg.ToID)
 	if err != nil {
 		return nil, err
 	}
@@ -90,6 +94,7 @@ func (q *Queries) ListEntriesInRange(ctx context.Context, arg ListEntriesInRange
 	for rows.Next() {
 		var i GrauditEntry
 		if err := rows.Scan(
+			&i.ChainID,
 			&i.EntryID,
 			&i.ActorID,
 			&i.EntityType,
@@ -111,18 +116,20 @@ func (q *Queries) ListEntriesInRange(ctx context.Context, arg ListEntriesInRange
 }
 
 const queryEntries = `-- name: QueryEntries :many
-SELECT entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash
+SELECT chain_id, entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash
 FROM graudit_entries
-WHERE ($1::text IS NULL OR actor_id = $1)
-  AND ($2::text IS NULL OR entity_type = $2)
-  AND ($3::text IS NULL OR entity_id = $3)
-  AND ($4::timestamptz IS NULL OR timestamp >= $4)
-  AND ($5::timestamptz IS NULL OR timestamp <= $5)
+WHERE chain_id = $1
+  AND ($2::text IS NULL OR actor_id = $2)
+  AND ($3::text IS NULL OR entity_type = $3)
+  AND ($4::text IS NULL OR entity_id = $4)
+  AND ($5::timestamptz IS NULL OR timestamp >= $5)
+  AND ($6::timestamptz IS NULL OR timestamp <= $6)
 ORDER BY entry_id ASC
-LIMIT $6::bigint
+LIMIT $7::bigint
 `
 
 type QueryEntriesParams struct {
+	ChainID    string             `db:"chain_id" json:"chain_id"`
 	ActorID    pgtype.Text        `db:"actor_id" json:"actor_id"`
 	EntityType pgtype.Text        `db:"entity_type" json:"entity_type"`
 	EntityID   pgtype.Text        `db:"entity_id" json:"entity_id"`
@@ -133,6 +140,7 @@ type QueryEntriesParams struct {
 
 func (q *Queries) QueryEntries(ctx context.Context, arg QueryEntriesParams) ([]GrauditEntry, error) {
 	rows, err := q.db.Query(ctx, queryEntries,
+		arg.ChainID,
 		arg.ActorID,
 		arg.EntityType,
 		arg.EntityID,
@@ -148,6 +156,7 @@ func (q *Queries) QueryEntries(ctx context.Context, arg QueryEntriesParams) ([]G
 	for rows.Next() {
 		var i GrauditEntry
 		if err := rows.Scan(
+			&i.ChainID,
 			&i.EntryID,
 			&i.ActorID,
 			&i.EntityType,

@@ -10,17 +10,23 @@ import (
 	"time"
 )
 
+// testHashChainID is used by every ComputeHash call in this file whose
+// test isn't specifically about chainID itself — a fixed, non-empty value
+// so these tests exercise the real (post-multi-chain) function signature
+// without each needing its own chain identifier.
+const testHashChainID = "chain-1"
+
 func TestComputeHash_DeterministicAcrossMapKeyOrder(t *testing.T) {
 	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 
 	payloadA := map[string]any{"a": 1, "b": "two", "c": true}
 	payloadB := map[string]any{"c": true, "a": 1, "b": "two"}
 
-	hashA, err := ComputeHash(1, "actor", "entity", "id", "create", payloadA, ts, GenesisPrevHash)
+	hashA, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", payloadA, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash(payloadA): %v", err)
 	}
-	hashB, err := ComputeHash(1, "actor", "entity", "id", "create", payloadB, ts, GenesisPrevHash)
+	hashB, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", payloadB, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash(payloadB): %v", err)
 	}
@@ -42,11 +48,11 @@ func TestComputeHash_DeterministicAcrossNestedMapKeyOrder(t *testing.T) {
 		"outer": map[string]any{"y": 2, "x": 1},
 	}
 
-	hashA, err := ComputeHash(1, "actor", "entity", "id", "create", payloadA, ts, GenesisPrevHash)
+	hashA, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", payloadA, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash(payloadA): %v", err)
 	}
-	hashB, err := ComputeHash(1, "actor", "entity", "id", "create", payloadB, ts, GenesisPrevHash)
+	hashB, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", payloadB, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash(payloadB): %v", err)
 	}
@@ -64,11 +70,11 @@ func TestComputeHash_LargeIntegerDoesNotBreakDeterminism(t *testing.T) {
 	// determinism trap UseNumber() exists to avoid.
 	payload := map[string]any{"count": 12345678901234}
 
-	hash1, err := ComputeHash(1, "actor", "entity", "id", "create", payload, ts, GenesisPrevHash)
+	hash1, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", payload, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
-	hash2, err := ComputeHash(1, "actor", "entity", "id", "create", payload, ts, GenesisPrevHash)
+	hash2, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", payload, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
@@ -88,11 +94,11 @@ func TestComputeHash_LargeIntegerDoesNotBreakDeterminism(t *testing.T) {
 func TestComputeHash_DifferentPayloadsProduceDifferentHashes(t *testing.T) {
 	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 
-	hash1, err := ComputeHash(1, "actor", "entity", "id", "create", map[string]any{"a": 1}, ts, GenesisPrevHash)
+	hash1, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", map[string]any{"a": 1}, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
-	hash2, err := ComputeHash(1, "actor", "entity", "id", "create", map[string]any{"a": 2}, ts, GenesisPrevHash)
+	hash2, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", map[string]any{"a": 2}, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
@@ -105,16 +111,38 @@ func TestComputeHash_DifferentPrevHashProducesDifferentHash(t *testing.T) {
 	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	payload := map[string]any{"a": 1}
 
-	hash1, err := ComputeHash(2, "actor", "entity", "id", "update", payload, ts, "hash-of-entry-1")
+	hash1, err := ComputeHash(testHashChainID, 2, "actor", "entity", "id", "update", payload, ts, "hash-of-entry-1")
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
-	hash2, err := ComputeHash(2, "actor", "entity", "id", "update", payload, ts, "different-prev-hash")
+	hash2, err := ComputeHash(testHashChainID, 2, "actor", "entity", "id", "update", payload, ts, "different-prev-hash")
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
 	if hash1 == hash2 {
 		t.Fatalf("expected different hashes for different PrevHash, both got %q", hash1)
+	}
+}
+
+// TestComputeHash_DifferentChainIDProducesDifferentHash proves ChainID is
+// part of the hash preimage, not just a storage/filter column — the
+// property that closes the chain-splice attack described in ComputeHash's
+// doc comment: without this, rewriting one entry's chain_id column
+// wouldn't invalidate its Hash.
+func TestComputeHash_DifferentChainIDProducesDifferentHash(t *testing.T) {
+	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
+	payload := map[string]any{"a": 1}
+
+	hash1, err := ComputeHash("chain-a", 1, "actor", "entity", "id", "create", payload, ts, GenesisPrevHash)
+	if err != nil {
+		t.Fatalf("ComputeHash: %v", err)
+	}
+	hash2, err := ComputeHash("chain-b", 1, "actor", "entity", "id", "create", payload, ts, GenesisPrevHash)
+	if err != nil {
+		t.Fatalf("ComputeHash: %v", err)
+	}
+	if hash1 == hash2 {
+		t.Fatalf("expected different hashes for different ChainID (all other fields identical), both got %q", hash1)
 	}
 }
 
@@ -129,11 +157,11 @@ func TestComputeHash_TruncatesSubMillisecondPrecision(t *testing.T) {
 	base := time.Date(2026, 7, 9, 12, 0, 0, 123_000_000, time.UTC) // .123 exactly
 	withNanoNoise := base.Add(456_789 * time.Nanosecond)           // .123456789, same millisecond
 
-	hash1, err := ComputeHash(1, "a", "t", "1", "create", nil, base, GenesisPrevHash)
+	hash1, err := ComputeHash(testHashChainID, 1, "a", "t", "1", "create", nil, base, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
-	hash2, err := ComputeHash(1, "a", "t", "1", "create", nil, withNanoNoise, GenesisPrevHash)
+	hash2, err := ComputeHash(testHashChainID, 1, "a", "t", "1", "create", nil, withNanoNoise, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
@@ -146,11 +174,11 @@ func TestComputeHash_DifferentMillisecondProducesDifferentHash(t *testing.T) {
 	ts1 := time.Date(2026, 7, 9, 12, 0, 0, 123_000_000, time.UTC)
 	ts2 := time.Date(2026, 7, 9, 12, 0, 0, 124_000_000, time.UTC)
 
-	hash1, err := ComputeHash(1, "a", "t", "1", "create", nil, ts1, GenesisPrevHash)
+	hash1, err := ComputeHash(testHashChainID, 1, "a", "t", "1", "create", nil, ts1, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
-	hash2, err := ComputeHash(1, "a", "t", "1", "create", nil, ts2, GenesisPrevHash)
+	hash2, err := ComputeHash(testHashChainID, 1, "a", "t", "1", "create", nil, ts2, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
@@ -161,14 +189,14 @@ func TestComputeHash_DifferentMillisecondProducesDifferentHash(t *testing.T) {
 
 func TestComputeHash_NilPayload(t *testing.T) {
 	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	if _, err := ComputeHash(1, "actor", "entity", "id", "create", nil, ts, GenesisPrevHash); err != nil {
+	if _, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", nil, ts, GenesisPrevHash); err != nil {
 		t.Fatalf("ComputeHash with nil payload: %v", err)
 	}
 }
 
 func TestComputeHash_HexEncodedSHA256Length(t *testing.T) {
 	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	hash, err := ComputeHash(1, "actor", "entity", "id", "create", nil, ts, GenesisPrevHash)
+	hash, err := ComputeHash(testHashChainID, 1, "actor", "entity", "id", "create", nil, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash: %v", err)
 	}
@@ -206,7 +234,7 @@ func TestDecodeStoredPayload_RoundTripPreservesHashForLargeInts(t *testing.T) {
 	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
 	original := map[string]any{"count": 12345678901234}
 
-	hashAtWrite, err := ComputeHash(1, "a", "t", "1", "create", original, ts, GenesisPrevHash)
+	hashAtWrite, err := ComputeHash(testHashChainID, 1, "a", "t", "1", "create", original, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash (write): %v", err)
 	}
@@ -222,7 +250,7 @@ func TestDecodeStoredPayload_RoundTripPreservesHashForLargeInts(t *testing.T) {
 		t.Fatalf("DecodeStoredPayload: %v", err)
 	}
 
-	hashAtVerify, err := ComputeHash(1, "a", "t", "1", "create", decoded, ts, GenesisPrevHash)
+	hashAtVerify, err := ComputeHash(testHashChainID, 1, "a", "t", "1", "create", decoded, ts, GenesisPrevHash)
 	if err != nil {
 		t.Fatalf("ComputeHash (verify): %v", err)
 	}
@@ -247,7 +275,7 @@ func TestCanonicalJSON_UnmarshalableValueErrors(t *testing.T) {
 
 func TestComputeHash_UnmarshalablePayloadErrors(t *testing.T) {
 	ts := time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC)
-	if _, err := ComputeHash(1, "a", "t", "1", "create", make(chan int), ts, GenesisPrevHash); err == nil {
+	if _, err := ComputeHash(testHashChainID, 1, "a", "t", "1", "create", make(chan int), ts, GenesisPrevHash); err == nil {
 		t.Fatal("expected an error for an unmarshalable payload, got nil")
 	}
 }

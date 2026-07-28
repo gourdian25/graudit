@@ -11,7 +11,7 @@ import (
 
 type Querier interface {
 	// File: internal/postgresdb/queries/audit.sql
-	GetLastEntry(ctx context.Context) (GrauditEntry, error)
+	GetLastEntry(ctx context.Context, chainID string) (GrauditEntry, error)
 	InsertEntry(ctx context.Context, arg InsertEntryParams) error
 	ListEntriesInRange(ctx context.Context, arg ListEntriesInRangeParams) ([]GrauditEntry, error)
 	QueryEntries(ctx context.Context, arg QueryEntriesParams) ([]GrauditEntry, error)

@@ -105,9 +105,9 @@ func TestComputeDiff_NoChanges(t *testing.T) {
 
 func TestBuildChangeEvent_ActionInference(t *testing.T) {
 	cases := []struct {
-		name           string
-		before, after  any
-		wantAction     string
+		name          string
+		before, after any
+		wantAction    string
 	}{
 		{"create", nil, map[string]any{"a": 1}, "create"},
 		{"delete", map[string]any{"a": 1}, nil, "delete"},
@@ -115,14 +115,14 @@ func TestBuildChangeEvent_ActionInference(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			event, err := BuildChangeEvent("actor:1", "widget", "w1", tc.before, tc.after)
+			event, err := BuildChangeEvent(testChainID, "actor:1", "widget", "w1", tc.before, tc.after)
 			if err != nil {
 				t.Fatalf("BuildChangeEvent: %v", err)
 			}
 			if event.Action != tc.wantAction {
 				t.Fatalf("Action = %q, want %q", event.Action, tc.wantAction)
 			}
-			if event.ActorID != "actor:1" || event.EntityType != "widget" || event.EntityID != "w1" {
+			if event.ChainID != testChainID || event.ActorID != "actor:1" || event.EntityType != "widget" || event.EntityID != "w1" {
 				t.Fatalf("unexpected identity fields: %+v", event)
 			}
 			if err := event.Validate(); err != nil {

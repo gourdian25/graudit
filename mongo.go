@@ -50,13 +50,11 @@ import (
 	"github.com/gourdian25/grevents"
 )
 
-const (
-	defaultCollection = "graudit_entries"
-	chainStateID      = "tail"
-)
+const defaultCollection = "graudit_entries"
 
 // entryDocument is the BSON document shape for a single chain entry.
 type entryDocument struct {
+	ChainID    string    `bson:"chainId"`
 	EntryID    uint64    `bson:"entryId"`
 	ActorID    string    `bson:"actorId"`
 	EntityType string    `bson:"entityType"`
@@ -74,13 +72,19 @@ func (d entryDocument) toAuditEvent() (AuditEvent, error) {
 		return AuditEvent{}, err
 	}
 	return AuditEvent{
-		ID: EntryID(d.EntryID), ActorID: d.ActorID, EntityType: d.EntityType, EntityID: d.EntityID,
+		ChainID: d.ChainID, ID: EntryID(d.EntryID), ActorID: d.ActorID, EntityType: d.EntityType, EntityID: d.EntityID,
 		Action: d.Action, Payload: payload, Timestamp: d.Timestamp.UTC(), Hash: d.Hash, PrevHash: d.PrevHash,
 	}, nil
 }
 
-// mongoChainState is the singleton tail document tracking the chain's
-// current end, stored in its own collection (<Collection>_chain_state).
+// mongoChainState is one chain's tail document tracking its current end,
+// stored in its own collection (<Collection>_chain_state) — one document
+// per ChainID, keyed by ID = the real chainID string (not a fixed
+// sentinel). This is a free source of per-chain concurrency: two Record
+// calls on different chains touch different chain-state documents, so
+// MongoDB's document-level transaction-conflict detection never forces
+// them to serialize against each other the way graudit's postgres backend
+// currently must via one global advisory lock (see docs/architecture.md).
 type mongoChainState struct {
 	ID          string `bson:"_id"`
 	LastEntryID uint64 `bson:"lastEntryId"`
@@ -228,12 +232,22 @@ func probeTransactionSupport(ctx context.Context, client *mongo.Client, chainCol
 	return err
 }
 
+// ensureAuditIndexes creates the fresh-deployment index shape: entryId is
+// only unique together with chainId (each chain independently restarts its
+// own EntryID sequence at 1), and the other indexes lead with chainId for
+// tenant-scoped query efficiency at scale. Upgrading an existing
+// pre-multi-chain deployment requires manually dropping the old
+// entryId_1 unique index first (db.graudit_entries.dropIndex("entryId_1"))
+// — left alongside this new compound index, it would incorrectly reject
+// every second chain's entryId=1. Not auto-detected/dropped here
+// deliberately: an unconditional drop would error against a fresh
+// deployment where that index never existed. See CHANGELOG.md.
 func ensureAuditIndexes(ctx context.Context, entries *mongo.Collection) error {
 	models := []mongo.IndexModel{
-		{Keys: bson.D{{Key: "entryId", Value: 1}}, Options: options.Index().SetUnique(true)},
-		{Keys: bson.D{{Key: "actorId", Value: 1}}},
-		{Keys: bson.D{{Key: "entityType", Value: 1}, {Key: "entityId", Value: 1}}},
-		{Keys: bson.D{{Key: "timestamp", Value: 1}}},
+		{Keys: bson.D{{Key: "chainId", Value: 1}, {Key: "entryId", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{Key: "chainId", Value: 1}, {Key: "actorId", Value: 1}}},
+		{Keys: bson.D{{Key: "chainId", Value: 1}, {Key: "entityType", Value: 1}, {Key: "entityId", Value: 1}}},
+		{Keys: bson.D{{Key: "chainId", Value: 1}, {Key: "timestamp", Value: 1}}},
 	}
 	_, err := entries.Indexes().CreateMany(ctx, models)
 	return err
@@ -270,33 +284,33 @@ func (a *mongoAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID, 
 	// a second, manual outer retry loop around it; that would be redundant.
 	_, err = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
 		var tail mongoChainState
-		tailErr := a.chainColl.FindOne(sc, bson.M{"_id": chainStateID}).Decode(&tail)
+		tailErr := a.chainColl.FindOne(sc, bson.M{"_id": event.ChainID}).Decode(&tail)
 		prevHash := GenesisPrevHash
 		nextID := EntryID(1)
 		switch {
 		case tailErr == nil:
 			prevHash, nextID = tail.LastHash, EntryID(tail.LastEntryID)+1
 		case errors.Is(tailErr, mongo.ErrNoDocuments):
-			// genesis: no tail doc yet
+			// genesis: no tail doc yet for this chain
 		default:
 			return nil, tailErr
 		}
 
-		hash, err := ComputeHash(nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
+		hash, err := ComputeHash(event.ChainID, nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
 		if err != nil {
 			return nil, err
 		}
 
 		doc := entryDocument{
-			EntryID: uint64(nextID), ActorID: event.ActorID, EntityType: event.EntityType, EntityID: event.EntityID,
+			ChainID: event.ChainID, EntryID: uint64(nextID), ActorID: event.ActorID, EntityType: event.EntityType, EntityID: event.EntityID,
 			Action: event.Action, Payload: payloadBytes, Timestamp: event.Timestamp, Hash: hash, PrevHash: prevHash,
 		}
 		if _, err := a.entries.InsertOne(sc, doc); err != nil {
 			return nil, err
 		}
 
-		if _, err := a.chainColl.ReplaceOne(sc, bson.M{"_id": chainStateID},
-			mongoChainState{ID: chainStateID, LastEntryID: uint64(nextID), LastHash: hash},
+		if _, err := a.chainColl.ReplaceOne(sc, bson.M{"_id": event.ChainID},
+			mongoChainState{ID: event.ChainID, LastEntryID: uint64(nextID), LastHash: hash},
 			options.Replace().SetUpsert(true)); err != nil {
 			return nil, err
 		}
@@ -315,8 +329,8 @@ func (a *mongoAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID, 
 
 // RecordChange implements AuditLog.RecordChange; see the interface's doc
 // comment for the full contract.
-func (a *mongoAuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error) {
-	event, err := BuildChangeEvent(actorID, entityType, entityID, before, after)
+func (a *mongoAuditLog) RecordChange(ctx context.Context, chainID, actorID, entityType, entityID string, before, after any) (EntryID, error) {
+	event, err := BuildChangeEvent(chainID, actorID, entityType, entityID, before, after)
 	if err != nil {
 		return 0, fmt.Errorf("graudit: record change: %w", err)
 	}
@@ -327,16 +341,19 @@ func (a *mongoAuditLog) RecordChange(ctx context.Context, actorID, entityType, e
 // Check A recomputes each entry's hash from its own stored fields and
 // compares against its stored Hash; Check B asserts each entry's stored
 // PrevHash equals the immediately preceding entry's stored Hash.
-func (a *mongoAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, VerifyResult, error) {
+func (a *mongoAuditLog) Verify(ctx context.Context, chainID string, from, to EntryID) (bool, VerifyResult, error) {
 	if a.closed.Load() {
 		return false, VerifyResult{}, ErrClosed
+	}
+	if chainID == "" {
+		return false, VerifyResult{}, ErrChainIDRequired
 	}
 	if from < 1 {
 		from = 1
 	}
 
 	cursor, err := a.entries.Find(ctx,
-		bson.M{"entryId": bson.M{"$gte": uint64(from), "$lte": uint64(to)}},
+		bson.M{"chainId": chainID, "entryId": bson.M{"$gte": uint64(from), "$lte": uint64(to)}},
 		options.Find().SetSort(bson.D{{Key: "entryId", Value: 1}}))
 	if err != nil {
 		return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", ErrBackendUnavailable)
@@ -364,7 +381,7 @@ func (a *mongoAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, Ver
 		if err != nil {
 			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
-		recomputed, err := ComputeHash(EntryID(doc.EntryID), doc.ActorID, doc.EntityType, doc.EntityID, doc.Action, payload, doc.Timestamp, doc.PrevHash)
+		recomputed, err := ComputeHash(doc.ChainID, EntryID(doc.EntryID), doc.ActorID, doc.EntityType, doc.EntityID, doc.Action, payload, doc.Timestamp, doc.PrevHash)
 		if err != nil {
 			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
@@ -385,8 +402,11 @@ func (a *mongoAuditLog) Query(ctx context.Context, filter QueryFilter) ([]AuditE
 	if a.closed.Load() {
 		return nil, ErrClosed
 	}
+	if filter.ChainID == "" {
+		return nil, ErrChainIDRequired
+	}
 
-	q := bson.M{}
+	q := bson.M{"chainId": filter.ChainID}
 	if filter.ActorID != "" {
 		q["actorId"] = filter.ActorID
 	}

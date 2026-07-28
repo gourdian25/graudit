@@ -23,6 +23,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,13 +39,37 @@ import (
 //go:embed internal/postgresdb/schema.sql
 var postgresSchemaSQL string
 
-// chainLockKey is the constant pg_advisory_xact_lock key for graudit's one
-// global chain in v1 — there is no per-tenant/per-chain partitioning yet
-// (see docs/architecture.md for the extension note). Scoped to a single
+// chainLockKey is the first argument to Record's pg_advisory_xact_lock(key1,
+// key2) call — the two-int32 overload, not the single-bigint one. key2 (see
+// chainLockSubKey) is what actually narrows serialization to one chain;
+// chainLockKey itself is just a fixed namespace shared by every chain, kept
+// as its own constant (rather than folded into the hash) so this library's
+// locks stay trivially distinguishable from an unrelated advisory lock
+// another tool might take against the same database. Scoped to a single
 // transaction (released automatically on commit/rollback) — distinct in
 // purpose and lifetime from grauditSchemaLockKey below, which guards schema
-// application at connect time, not per-Record serialization.
-const chainLockKey int64 = 892374651
+// application at connect time, not per-Record serialization. See
+// docs/architecture.md's "Postgres advisory-lock chain scoping" section.
+const chainLockKey int32 = 892374651
+
+// chainLockSubKey deterministically derives Record's pg_advisory_xact_lock
+// key2 argument from chainID via FNV-1a (hash/fnv — deliberately not
+// hash/maphash, which is randomly reseeded per process specifically to
+// resist hash-flooding, so the same chainID would hash differently across
+// connections/processes and defeat the lock's entire purpose: two writers
+// on the same chain must agree on which key they're contending for). A
+// collision between two different chainIDs' hashes only costs extra,
+// harmless serialization — chain_id remains the authoritative filter in
+// every query regardless of lock granularity — never corruption; an
+// accepted, low-severity trade-off given chainID values are
+// tenant-provisioning-assigned, not raw adversarial end-user input (the
+// same "document, don't guard" convention already used for probeDocID and
+// grauditSchemaLockKey's own collision risk).
+func chainLockSubKey(chainID string) int32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(chainID)) // hash.Hash.Write on an in-memory FNV hash never returns an error
+	return int32(h.Sum32())         //nolint:gosec // deliberate bit-reinterpretation for a lock key, not a numeric value — see chainLockSubKey's own doc comment
+}
 
 // grauditSchemaLockKey is a fixed Postgres advisory-lock key used by
 // applyPostgresSchema to serialize schema application across concurrent
@@ -58,19 +83,34 @@ const grauditSchemaLockKey int64 = 5_198_204_733
 
 // PostgresConfig configures an AuditLog constructed by NewPostgresAuditLog.
 type PostgresConfig struct {
-	// DSN is a standard libpq/pgx connection string. Required.
+	// DSN is a standard libpq/pgx connection string. Exactly one of DSN or
+	// Pool must be set.
 	DSN string
 
+	// Pool, if set, is used directly instead of dialing a new pool from
+	// DSN — lets graudit share one pgxpool.Pool with the rest of your
+	// application instead of opening its own dedicated connections. This
+	// matters at multi-tenant scale: a deployment serving hundreds of
+	// tenant chains (see docs/architecture.md's multi-chain section) wants
+	// one AuditLog instance backed by one shared pool, not one pool per
+	// tenant. graudit never closes a Pool it did not create itself —
+	// Close only closes the pool when it was dialed from DSN here.
+	// Exactly one of DSN or Pool must be set. Mirrors grnoti's own
+	// PostgresConfig.Pool.
+	Pool *pgxpool.Pool
+
 	// MaxConns caps the pgxpool connection pool size. 0 means use pgxpool's
-	// own default.
+	// own default. Ignored when Pool is set — tune the pool yourself
+	// before passing it in.
 	MaxConns int32
 
 	// MinConns is the minimum number of connections pgxpool keeps ready.
-	// 0 means use pgxpool's own default.
+	// 0 means use pgxpool's own default. Ignored when Pool is set.
 	MinConns int32
 
 	// MaxConnLifetime bounds how long a pooled connection may be reused
 	// before being recycled. 0 means pgxpool's own default (unlimited).
+	// Ignored when Pool is set.
 	MaxConnLifetime time.Duration
 
 	// Logger receives optional diagnostic messages (connection failures,
@@ -91,40 +131,90 @@ type postgresAuditLog struct {
 	logger Logger
 	bus    grevents.Bus
 
+	// ownsPool is true only when pool was dialed from cfg.DSN by
+	// connectPostgres, false when cfg.Pool was supplied externally — Close
+	// must never close a pool it doesn't own.
+	ownsPool bool
+
 	closed    atomic.Bool
 	closeOnce sync.Once
 }
 
 var _ AuditLog = (*postgresAuditLog)(nil)
 
-// NewPostgresAuditLog opens a connection pool per cfg, applies the schema
-// (table graudit_entries, serialized by a Postgres advisory lock so
-// concurrent callers building an audit log against the same fresh database
-// don't race on the DDL), and validates connectivity via Ping before
-// returning.
+// NewPostgresAuditLog opens a connection pool per cfg (or reuses cfg.Pool,
+// if set), applies the schema (table graudit_entries, serialized by a
+// Postgres advisory lock so concurrent callers building an audit log
+// against the same fresh database don't race on the DDL), and validates
+// connectivity via Ping before returning.
 //
 // Parameters:
-//   - cfg: PostgresConfig — DSN is required
+//   - cfg: PostgresConfig — exactly one of DSN or Pool is required
 //
 // Returns:
 //   - AuditLog: ready to use
-//   - error: non-nil if DSN is empty or malformed, the connection/Ping
-//     fails (wrapping ErrBackendUnavailable), or schema application fails
+//   - error: non-nil if DSN/Pool are both set or both unset, DSN is
+//     malformed, the connection/Ping fails (wrapping ErrBackendUnavailable),
+//     or schema application fails
 //
 // Example:
 //
 //	log, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 //		DSN: "host=localhost user=myuser password=mypass dbname=mydb port=5432 sslmode=disable",
 //	})
+//
+// Or, sharing a pool across multiple chains/services (e.g. a multi-tenant
+// deployment where one AuditLog instance serves hundreds of tenant chains —
+// see docs/architecture.md's multi-chain section):
+//
+//	log, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
+//		Pool: sharedPool, // *pgxpool.Pool your application already owns
+//	})
 func NewPostgresAuditLog(cfg PostgresConfig) (AuditLog, error) {
-	if cfg.DSN == "" {
-		return nil, fmt.Errorf("graudit: PostgresConfig.DSN is required")
-	}
 	appLogger := OrNop(cfg.Logger)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, q, ownsPool, err := connectPostgres(ctx, cfg, "AuditLog")
+	if err != nil {
+		appLogger.Error("graudit: connect failed", "error", err)
+		return nil, err
+	}
+
+	appLogger.Info("graudit: connected")
+	return &postgresAuditLog{pool: pool, q: q, logger: appLogger, bus: cfg.EventBus, ownsPool: ownsPool}, nil
+}
+
+// connectPostgres resolves cfg to a pgxpool.Pool — either dialing a new one
+// from cfg.DSN or reusing cfg.Pool directly — validates connectivity via
+// Ping, applies the embedded schema, and returns whether the returned pool
+// is owned by this call: true only when dialed from DSN here, false when
+// cfg.Pool was supplied externally, since an externally-supplied pool is
+// never graudit's to close (see postgresAuditLog.ownsPool and Close).
+// Mirrors grnoti's own connectPostgres helper (grnoti/postgres.go) — that
+// package has several Postgres-backed stores sharing this helper, hence
+// the component parameter for error messages; graudit currently has only
+// NewPostgresAuditLog as a caller, but the shape is kept identical for
+// ecosystem consistency.
+func connectPostgres(ctx context.Context, cfg PostgresConfig, component string) (*pgxpool.Pool, *postgresdb.Queries, bool, error) {
+	if (cfg.DSN == "") == (cfg.Pool == nil) {
+		return nil, nil, false, fmt.Errorf("graudit: exactly one of PostgresConfig.DSN or PostgresConfig.Pool is required for %s", component)
+	}
+
+	if cfg.Pool != nil {
+		if err := cfg.Pool.Ping(ctx); err != nil {
+			return nil, nil, false, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
+		}
+		if err := applyPostgresSchema(ctx, cfg.Pool); err != nil {
+			return nil, nil, false, fmt.Errorf("graudit: apply schema: %w", err)
+		}
+		return cfg.Pool, postgresdb.New(cfg.Pool), false, nil
+	}
 
 	poolCfg, err := pgxpool.ParseConfig(cfg.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("graudit: parse dsn: %w", ErrBackendUnavailable)
+		return nil, nil, false, fmt.Errorf("graudit: parse dsn: %w", ErrBackendUnavailable)
 	}
 	if cfg.MaxConns > 0 {
 		poolCfg.MaxConns = cfg.MaxConns
@@ -136,28 +226,22 @@ func NewPostgresAuditLog(cfg PostgresConfig) (AuditLog, error) {
 		poolCfg.MaxConnLifetime = cfg.MaxConnLifetime
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		appLogger.Error("graudit: open failed", "error", err)
-		return nil, fmt.Errorf("graudit: open: %w", ErrBackendUnavailable)
+		return nil, nil, false, fmt.Errorf("graudit: open: %w", ErrBackendUnavailable)
 	}
 
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
-		appLogger.Error("graudit: ping failed", "error", err)
-		return nil, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
+		return nil, nil, false, fmt.Errorf("graudit: ping: %w", ErrBackendUnavailable)
 	}
 
 	if err := applyPostgresSchema(ctx, pool); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("graudit: apply schema: %w", err)
+		return nil, nil, false, fmt.Errorf("graudit: apply schema: %w", err)
 	}
 
-	appLogger.Info("graudit: connected")
-	return &postgresAuditLog{pool: pool, q: postgresdb.New(pool), logger: appLogger, bus: cfg.EventBus}, nil
+	return pool, postgresdb.New(pool), true, nil
 }
 
 // applyPostgresSchema applies the embedded schema against pool, serialized
@@ -217,7 +301,7 @@ func postgresEntryToAuditEvent(row postgresdb.GrauditEntry) (AuditEvent, error) 
 		return AuditEvent{}, err
 	}
 	return AuditEvent{
-		ID: pgEntryID(row.EntryID), ActorID: row.ActorID, EntityType: row.EntityType, EntityID: row.EntityID,
+		ChainID: row.ChainID, ID: pgEntryID(row.EntryID), ActorID: row.ActorID, EntityType: row.EntityType, EntityID: row.EntityID,
 		Action: row.Action, Payload: payload, Timestamp: row.Timestamp.Time.UTC(), Hash: row.Hash, PrevHash: row.PrevHash,
 	}, nil
 }
@@ -244,33 +328,34 @@ func (a *postgresAuditLog) Record(ctx context.Context, event AuditEvent) (EntryI
 	var recorded AuditEvent
 	err = pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		// Advisory lock scoped to this one transaction; released
-		// automatically on commit/rollback. A single constant key: one
-		// global chain in v1, no per-tenant sub-chains.
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", chainLockKey); err != nil {
+		// automatically on commit/rollback. The two-int32 form serializes
+		// only Record calls on the same chain against each other — see
+		// chainLockKey/chainLockSubKey's own doc comments.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)", chainLockKey, chainLockSubKey(event.ChainID)); err != nil {
 			return err
 		}
 
 		q := a.q.WithTx(tx)
 		prevHash := GenesisPrevHash
 		nextID := EntryID(1)
-		last, err := q.GetLastEntry(ctx)
+		last, err := q.GetLastEntry(ctx, event.ChainID)
 		switch {
 		case err == nil:
 			prevHash = last.Hash
 			nextID = pgEntryID(last.EntryID) + 1
 		case errors.Is(err, pgx.ErrNoRows):
-			// genesis: no rows yet
+			// genesis: no rows yet for this chain
 		default:
 			return err
 		}
 
-		hash, err := ComputeHash(nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
+		hash, err := ComputeHash(event.ChainID, nextID, event.ActorID, event.EntityType, event.EntityID, event.Action, event.Payload, event.Timestamp, prevHash)
 		if err != nil {
 			return err
 		}
 
 		if err := q.InsertEntry(ctx, postgresdb.InsertEntryParams{
-			EntryID: toPgEntryID(nextID), ActorID: event.ActorID, EntityType: event.EntityType, EntityID: event.EntityID,
+			ChainID: event.ChainID, EntryID: toPgEntryID(nextID), ActorID: event.ActorID, EntityType: event.EntityType, EntityID: event.EntityID,
 			Action: event.Action, Payload: payloadBytes, Timestamp: pgTimestamptz(event.Timestamp), Hash: hash, PrevHash: prevHash,
 		}); err != nil {
 			return err
@@ -290,8 +375,8 @@ func (a *postgresAuditLog) Record(ctx context.Context, event AuditEvent) (EntryI
 
 // RecordChange implements AuditLog.RecordChange; see the interface's doc
 // comment for the full contract.
-func (a *postgresAuditLog) RecordChange(ctx context.Context, actorID, entityType, entityID string, before, after any) (EntryID, error) {
-	event, err := BuildChangeEvent(actorID, entityType, entityID, before, after)
+func (a *postgresAuditLog) RecordChange(ctx context.Context, chainID, actorID, entityType, entityID string, before, after any) (EntryID, error) {
+	event, err := BuildChangeEvent(chainID, actorID, entityType, entityID, before, after)
 	if err != nil {
 		return 0, fmt.Errorf("graudit: record change: %w", err)
 	}
@@ -304,15 +389,18 @@ func (a *postgresAuditLog) RecordChange(ctx context.Context, actorID, entityType
 // PrevHash equals the immediately preceding entry's stored Hash. Both are
 // required — Check A alone would not detect a deleted row or a rewritten
 // PrevHash pointing at a tampered predecessor.
-func (a *postgresAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, VerifyResult, error) {
+func (a *postgresAuditLog) Verify(ctx context.Context, chainID string, from, to EntryID) (bool, VerifyResult, error) {
 	if a.closed.Load() {
 		return false, VerifyResult{}, ErrClosed
+	}
+	if chainID == "" {
+		return false, VerifyResult{}, ErrChainIDRequired
 	}
 	if from < 1 {
 		from = 1
 	}
 
-	rows, err := a.q.ListEntriesInRange(ctx, postgresdb.ListEntriesInRangeParams{FromID: toPgEntryID(from), ToID: toPgEntryID(to)})
+	rows, err := a.q.ListEntriesInRange(ctx, postgresdb.ListEntriesInRangeParams{ChainID: chainID, FromID: toPgEntryID(from), ToID: toPgEntryID(to)})
 	if err != nil {
 		return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", ErrBackendUnavailable)
 	}
@@ -333,7 +421,7 @@ func (a *postgresAuditLog) Verify(ctx context.Context, from, to EntryID) (bool, 
 		if err != nil {
 			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
-		recomputed, err := ComputeHash(pgEntryID(row.EntryID), row.ActorID, row.EntityType, row.EntityID, row.Action, payload, row.Timestamp.Time, row.PrevHash)
+		recomputed, err := ComputeHash(row.ChainID, pgEntryID(row.EntryID), row.ActorID, row.EntityType, row.EntityID, row.Action, payload, row.Timestamp.Time, row.PrevHash)
 		if err != nil {
 			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
 		}
@@ -354,8 +442,11 @@ func (a *postgresAuditLog) Query(ctx context.Context, filter QueryFilter) ([]Aud
 	if a.closed.Load() {
 		return nil, ErrClosed
 	}
+	if filter.ChainID == "" {
+		return nil, ErrChainIDRequired
+	}
 
-	var params postgresdb.QueryEntriesParams
+	params := postgresdb.QueryEntriesParams{ChainID: filter.ChainID}
 	if filter.ActorID != "" {
 		params.ActorID = pgtype.Text{String: filter.ActorID, Valid: true}
 	}
@@ -391,11 +482,16 @@ func (a *postgresAuditLog) Query(ctx context.Context, filter QueryFilter) ([]Aud
 	return out, nil
 }
 
-// Close implements AuditLog.Close; idempotent via sync.Once.
+// Close implements AuditLog.Close; idempotent via sync.Once. Only closes
+// the underlying pool when this AuditLog dialed it itself (ownsPool) — a
+// pool supplied via PostgresConfig.Pool is the caller's to close, since
+// other consumers of a shared pool may still be using it.
 func (a *postgresAuditLog) Close() error {
 	a.closeOnce.Do(func() {
 		a.closed.Store(true)
-		a.pool.Close()
+		if a.ownsPool {
+			a.pool.Close()
+		}
 		a.logger.Info("graudit: audit log closed")
 	})
 	return nil
