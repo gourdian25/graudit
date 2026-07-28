@@ -28,6 +28,16 @@ const postgresTestDSN = "host=localhost user=postgres_user password=postgres_pas
 // actually just test-isolation bugs. Errors are ignored (surfaced properly
 // by the subsequent NewPostgresAuditLog call's own connect/ping instead) so
 // this is safe to call even when Postgres isn't reachable at all.
+//
+// DROP TABLE (not TRUNCATE): this table's schema itself changes across
+// graudit versions (e.g. the chain_id column/composite primary key added
+// for multi-chain support) — CREATE TABLE IF NOT EXISTS inside
+// NewPostgresAuditLog no-ops against an existing, differently-shaped
+// table, so TRUNCATE alone would silently leave a locally-iterated-on test
+// database on the old schema and fail every test with a confusing "column
+// does not exist" error instead of an obviously schema-related one.
+// Dropping and letting schema application recreate it from scratch makes
+// the local/CI loop self-healing across any future schema change too.
 func truncatePostgresTestDB() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -40,7 +50,7 @@ func truncatePostgresTestDB() {
 
 	// Ignored if the table doesn't exist yet — schema application inside
 	// NewPostgresAuditLog creates it on first connect.
-	_, _ = pool.Exec(ctx, "TRUNCATE TABLE graudit_entries")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS graudit_entries")
 }
 
 func newPostgresLog() (AuditLog, error) {
@@ -56,7 +66,7 @@ func newPostgresLogWithBus(bus *stubBus) (AuditLog, error) {
 // tamperPostgresEntry bypasses the AuditLog interface entirely via a raw
 // SQL UPDATE against the same test DB, simulating an attacker or a bug
 // elsewhere touching the table directly.
-func tamperPostgresEntry(t *testing.T, log AuditLog, entryID EntryID) {
+func tamperPostgresEntry(t *testing.T, log AuditLog, chainID string, entryID EntryID) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -67,7 +77,7 @@ func tamperPostgresEntry(t *testing.T, log AuditLog, entryID EntryID) {
 	}
 	defer pool.Close()
 
-	tag, err := pool.Exec(ctx, `UPDATE graudit_entries SET payload = $1 WHERE entry_id = $2`, []byte(`{"tampered":true}`), int64(entryID))
+	tag, err := pool.Exec(ctx, `UPDATE graudit_entries SET payload = $1 WHERE chain_id = $2 AND entry_id = $3`, []byte(`{"tampered":true}`), chainID, int64(entryID))
 	if err != nil {
 		t.Fatalf("tamper UPDATE: %v", err)
 	}
@@ -141,7 +151,7 @@ func TestPostgresAuditLog_RecordChange_InvalidPayload(t *testing.T) {
 	}
 	defer log.Close()
 
-	if _, err := log.RecordChange(context.Background(), "actor:1", "widget", "w1", make(chan int), nil); !errors.Is(err, ErrInvalidEvent) {
+	if _, err := log.RecordChange(context.Background(), testChainID, "actor:1", "widget", "w1", make(chan int), nil); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("RecordChange with an unmarshalable before value: err=%v, want ErrInvalidEvent", err)
 	}
 }

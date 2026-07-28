@@ -12,7 +12,7 @@ func newMemoryLogWithBus(bus *stubBus) (AuditLog, error) {
 	return NewMemoryAuditLog(WithEventBus(bus))
 }
 
-func tamperMemoryEntry(t *testing.T, log AuditLog, entryID EntryID) {
+func tamperMemoryEntry(t *testing.T, log AuditLog, chainID string, entryID EntryID) {
 	t.Helper()
 	a, ok := log.(*memoryAuditLog)
 	if !ok {
@@ -22,12 +22,12 @@ func tamperMemoryEntry(t *testing.T, log AuditLog, entryID EntryID) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for i := range a.entries {
-		if a.entries[i].ID == entryID {
+		if a.entries[i].ChainID == chainID && a.entries[i].ID == entryID {
 			a.entries[i].Payload = map[string]any{"tampered": true}
 			return
 		}
 	}
-	t.Fatalf("tamperMemoryEntry: entry %d not found", entryID)
+	t.Fatalf("tamperMemoryEntry: entry (chain %q, id %d) not found", chainID, entryID)
 }
 
 func TestNewMemoryAuditLog_NeverFails(t *testing.T) {

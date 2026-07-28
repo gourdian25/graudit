@@ -43,8 +43,14 @@ func main() {
 
 	ctx := context.Background()
 
+	// ChainID scopes every call below to one independent hash chain — a
+	// single AuditLog instance can serve any number of chains (e.g. one
+	// per tenant in a multi-tenant deployment); see docs/architecture.md.
+	const chainID = "tenant:acme"
+
 	// Record a direct entry.
 	id1, err := auditLog.Record(ctx, graudit.AuditEvent{
+		ChainID:    chainID,
 		ActorID:    "user:42",
 		EntityType: "invoice",
 		EntityID:   "inv_123",
@@ -57,7 +63,7 @@ func main() {
 	fmt.Println("recorded entry", id1)
 
 	// RecordChange diffs a before/after pair automatically.
-	id2, err := auditLog.RecordChange(ctx, "user:42", "invoice", "inv_123",
+	id2, err := auditLog.RecordChange(ctx, chainID, "user:42", "invoice", "inv_123",
 		map[string]any{"amount": 100, "status": "draft"},
 		map[string]any{"amount": 100, "status": "sent"},
 	)
@@ -67,14 +73,14 @@ func main() {
 	fmt.Println("recorded change entry", id2)
 
 	// Verify confirms the chain hasn't been tampered with.
-	ok, detail, err := auditLog.Verify(ctx, 1, id2)
+	ok, detail, err := auditLog.Verify(ctx, chainID, 1, id2)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("verify (before tampering): ok=%v detail=%+v\n", ok, detail)
 
 	// Query entries for this entity.
-	entries, err := auditLog.Query(ctx, graudit.QueryFilter{EntityType: "invoice", EntityID: "inv_123"})
+	entries, err := auditLog.Query(ctx, graudit.QueryFilter{ChainID: chainID, EntityType: "invoice", EntityID: "inv_123"})
 	if err != nil {
 		log.Fatal(err)
 	}

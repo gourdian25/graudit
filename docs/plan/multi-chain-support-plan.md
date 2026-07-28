@@ -67,7 +67,7 @@ gotcha (see decision #11 below).
 
 | Stage | Scope | Status |
 |---|---|---|
-| Stage 1 | Core multi-chain support (hash, interface, all 3 backends, schema/queries, test retrofit + isolation tests) | Not started |
+| Stage 1 | Core multi-chain support (hash, interface, all 3 backends, schema/queries, test retrofit + isolation tests) | ✅ Done |
 | Stage 2 | Postgres advisory-lock chain-scoping (performance only, no behavior change) | Not started |
 | Stage 3 | `PostgresConfig.Pool` injection (mirrors grnoti) | Not started |
 | Stage 4 | Docs / CHANGELOG / version bump / example.go | Not started |
@@ -330,6 +330,72 @@ self-healing), and run the full contract suite live against both networked
 backends — specifically confirm `ChainIsolation`,
 `ChainIsolationTamperContainment`, and `ConcurrentRecordStressMultiChain`
 pass on all three backends.
+
+### Stage 1 completion notes
+
+Implemented exactly as scoped, plus three real bugs caught and fixed along
+the way that the plan's mechanical retrofit description didn't anticipate:
+
+- **`hash/fnv`'s package name collides with this repo's own `hash.go`
+  filename** — not an issue (Go imports by package identifier, not
+  filename), noting only because it's worth remembering for Stage 2, which
+  will actually import `hash/fnv`.
+- **`sqlc generate` strips the `bark`-maintained `// File: ...` header** on
+  every regenerated file (confirmed: this already happened before this
+  stage too, just not previously visible in a diff) — `bark tag` restores
+  it; this is now a required step after any future `sqlc generate` run,
+  not just this one.
+- **Three genuine test bugs found via `go vet`/local reasoning, not just
+  mechanical signature fixes**:
+  1. `audit_test.go`'s `TestAuditEvent_Validate_OK`/`_NilPayloadOK`/
+     `_NonSerializablePayload` would have started failing at runtime (not
+     just missed their intended assertion) — none of their `AuditEvent{}`
+     literals had set `ChainID`, and `Validate()`'s new `ChainID` check now
+     fires before anything else in the switch. Fixed by adding
+     `ChainID: "c1"` to each. `TestAuditEvent_Validate_MissingFields`'s
+     existing per-field cases had the same problem in a quieter form: they
+     still passed (the dual-wrapped error still satisfies
+     `errors.Is(err, ErrInvalidEvent)`), but were silently testing "missing
+     ChainID" instead of their named field. Fixed by giving every case a
+     `ChainID` except the new dedicated "missing ChainID" one.
+  2. `internal_coverage_test.go`'s `TestPostgresAuditLog_OperationsAfterPoolClosed`/
+     `TestMongoAuditLog_OperationsAfterClientDisconnected` both call
+     `log.Query(ctx, QueryFilter{})` specifically to prove the closed
+     pool/disconnected client produces `ErrBackendUnavailable` — but an
+     empty `QueryFilter{}` now hits the new `ErrChainIDRequired` check
+     before the method ever touches the pool/client, which would have
+     made both tests assert the wrong sentinel silently passing for the
+     wrong reason. Fixed by adding `ChainID: testChainID` to both.
+  3. Postgres's/Mongo's `VerifyDetectsChainLinkageBreak` tests' raw
+     tamper-injection SQL/driver calls (`UPDATE ... WHERE entry_id = 2` /
+     `bson.M{"entryId": uint64(2)}`) needed a `chain_id`/`chainId`
+     predicate added — with `entry_id`/`entryId` no longer globally unique
+     across chains, an untargeted tamper could in principle hit the wrong
+     chain's entry once more than one chain's data coexists in the test
+     database (harmless today since these tests only ever seed one chain,
+     but was a latent correctness gap in the tamper injection itself,
+     fixed proactively).
+- **`postgres_test.go`'s `truncatePostgresTestDB` changed from `TRUNCATE
+  TABLE` to `DROP TABLE IF EXISTS`** exactly as planned (decision #11) —
+  confirmed necessary by testing against this session's own already-
+  existing local `graudit_test` database, which was on the pre-`chain_id`
+  schema; `TRUNCATE`-only would have left it there silently.
+- All three new contract scenarios (`ChainIsolation`,
+  `ChainIsolationTamperContainment`, `ConcurrentRecordStressMultiChain`)
+  pass on all three backends. Full verification green: `go build ./...`,
+  `go vet ./...`, `gofmt -l .` (clean), `bark check` (clean, after `bark
+  tag` restored the sqlc-regenerated files' headers), `golangci-lint run
+  ./...` (0 issues), `go test -race -timeout 5m .` (full suite, all 3
+  backends via `make docker-up`), `make coverage-check` (95.4%, meets the
+  95% gate), `go run ./example` (updated with a minimal single-chain
+  `ChainID` fix to keep `go build ./...` compiling — the full two-chain
+  demo is Stage 4's job per the plan, not redone here).
+- `docs/architecture.md` gained two new sections (multi-chain support /
+  hash-preimage rationale; Postgres advisory-lock chain scoping, describing
+  Stage 2 ahead of time) plus small in-place fixes to the pre-existing
+  "No SERIAL/BIGSERIAL" and "mongo backend requires a replica set"
+  sections, which referenced the old single global chain / fixed `"tail"`
+  chain-state document and were now stale.
 
 ## Stage 2 — Postgres advisory-lock chain-scoping
 
