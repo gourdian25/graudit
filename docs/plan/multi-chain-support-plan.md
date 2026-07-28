@@ -68,7 +68,7 @@ gotcha (see decision #11 below).
 | Stage | Scope | Status |
 |---|---|---|
 | Stage 1 | Core multi-chain support (hash, interface, all 3 backends, schema/queries, test retrofit + isolation tests) | ✅ Done |
-| Stage 2 | Postgres advisory-lock chain-scoping (performance only, no behavior change) | Not started |
+| Stage 2 | Postgres advisory-lock chain-scoping (performance only, no behavior change) | ✅ Done |
 | Stage 3 | `PostgresConfig.Pool` injection (mirrors grnoti) | Not started |
 | Stage 4 | Docs / CHANGELOG / version bump / example.go | Not started |
 | Stage 5 | Full validation pass | Not started |
@@ -428,6 +428,57 @@ without them this change would be strictly cosmetic).
 confirm cross-chain writes no longer serialize against each other while
 same-chain writes still do; re-run `ConcurrentRecordStressMultiChain` from
 Stage 1 to confirm correctness is unchanged.
+
+### Stage 2 completion notes
+
+Implemented exactly as scoped, with one small deviation from the plan's
+literal wording worth recording:
+
+- **`chainLockKey`'s declared type changed from `int64` to `int32`
+  directly**, rather than casting `int32(chainLockKey)` inline at the one
+  call site as the plan's decision #8 literally described. Since the
+  constant's only use is now as the first argument to the two-`int32`
+  `pg_advisory_xact_lock` overload, declaring it as `int32` from the start
+  is simpler and makes an accidental future reintroduction of the
+  single-`bigint` call form (which would silently need a different-typed
+  key) a compile error instead of a silent implicit conversion. The
+  constant's *value* (`892374651`) is unchanged.
+- New `chainLockSubKey(chainID string) int32` (`postgres.go`) computes the
+  FNV-1a hash via `hash/fnv`'s `fnv.New32a()`, exactly as planned; the
+  `gosec` G115 conversion warning on `int32(h.Sum32())` is suppressed with
+  a `//nolint:gosec` comment matching the existing `pgEntryID`/
+  `toPgEntryID` precedent in the same file.
+- `Record`'s advisory-lock call changed from
+  `SELECT pg_advisory_xact_lock($1)` to
+  `SELECT pg_advisory_xact_lock($1, $2)` with `(chainLockKey,
+  chainLockSubKey(event.ChainID))` — the only functional change in this
+  stage. The stale inline comment above the call ("A single constant key:
+  one global chain in v1, no per-tenant sub-chains") was also updated;
+  `chainLockKey`'s own doc comment was largely already-Stage-2-aware from
+  Stage 1's writing (it explicitly named this exact refinement as
+  upcoming), so only needed finishing, not rewriting.
+- `docs/architecture.md`'s "Postgres advisory-lock chain scoping" section
+  (written in Stage 1, ahead of this stage's own implementation) updated
+  from future/planned tense to describe the landed implementation,
+  including the `chainLockKey` type-change detail above.
+- **New benchmark** (`postgres_test.go`,
+  `BenchmarkPostgresAuditLog_Record_ChainConcurrency`, this repo's
+  first-ever `Benchmark*` function) with `SameChain`/`CrossChain`
+  subbenchmarks using `b.RunParallel`. Measured
+  (`-benchtime=2s`, Apple M4, local `make docker-up` Postgres):
+  **SameChain 381,373 ns/op vs. CrossChain 174,909 ns/op — cross-chain
+  writes are ~2.2x faster**, empirically confirming the lock no longer
+  serializes unrelated chains against each other while same-chain writes
+  remain fully serialized (`ConcurrentRecordStressMultiChain` from Stage 1
+  re-run and still green, confirming correctness is unchanged).
+- Full verification green: `go build ./...`, `go vet ./...`, `gofmt -l .`
+  (clean), `golangci-lint run ./...` (0 issues), `bark check` (clean, no
+  new files), `go test -race -timeout 5m .` (full suite), the full
+  `TestAuditLog_Contract/Postgres` subtree re-run individually and green,
+  `make coverage-check` (95.4%, unchanged from Stage 1 — this stage added
+  one new small function fully exercised by the existing contract suite
+  plus the benchmark itself, which coverage tooling doesn't count as a
+  test).
 
 ## Stage 3 — `PostgresConfig.Pool` injection
 

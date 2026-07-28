@@ -96,20 +96,26 @@ chains share one database. Since `GetLastEntry`/`InsertEntry`/
 global lock is strictly stronger than required — over-serialization is a
 throughput cost, never a correctness gap — so this was addressed in two
 steps rather than one: multi-chain support itself shipped first with the
-lock left global (still correct, not yet scale-optimal), then narrowed
-separately via Postgres's two-`int32`-argument `pg_advisory_xact_lock(key1,
-key2)` overload: `key1` stays the existing `chainLockKey` constant
-(already fits `int32`), `key2` is an FNV-1a 32-bit hash of `chainID`
-(`hash/fnv` — deliberately not `hash/maphash`, which is randomly reseeded
-per process and would hash the same `chainID` differently across
-connections, breaking the lock's whole purpose). A hash collision between
-two different `chainID`s only costs extra (harmless) serialization, never
-corruption, since the SQL `chain_id` filter remains authoritative
-regardless of lock granularity — an accepted, low-severity trade-off given
-`chainID` values are tenant-provisioning-assigned, not raw adversarial
-end-user input, the same "document, don't guard" convention already used
-for `probeDocID` and the schema-lock-key collision comments elsewhere in
-this file.
+lock left global (still correct, not yet scale-optimal), then narrowed in
+a separate follow-up via Postgres's two-`int32`-argument
+`pg_advisory_xact_lock(key1, key2)` overload: `key1` is the `chainLockKey`
+constant (declared as `int32` directly, since that's its only use now —
+the value itself, `892374651`, is unchanged and always fit in an `int32`),
+`key2` is `chainLockSubKey(chainID)`, an FNV-1a 32-bit hash (`hash/fnv` —
+deliberately not `hash/maphash`, which is randomly reseeded per process and
+would hash the same `chainID` differently across connections, breaking the
+lock's whole purpose: two writers on the same chain must agree on which key
+they're contending for). A hash collision between two different `chainID`s
+only costs extra (harmless) serialization, never corruption, since the SQL
+`chain_id` filter remains authoritative regardless of lock granularity — an
+accepted, low-severity trade-off given `chainID` values are
+tenant-provisioning-assigned, not raw adversarial end-user input, the same
+"document, don't guard" convention already used for `probeDocID` and the
+schema-lock-key collision comments elsewhere in this file. `chainLockKey`
+itself stays a separate constant rather than folding into the hash, purely
+so this library's locks remain trivially distinguishable (by their fixed
+`key1`) from an unrelated advisory lock another tool might take against the
+same database.
 
 The mongo backend needed no equivalent follow-up: keying each chain's
 chain-state singleton document's `_id` directly by the real `chainID`

@@ -5,6 +5,8 @@ package graudit
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -163,3 +165,71 @@ func TestPostgresAuditLog_RecordChange_InvalidPayload(t *testing.T) {
 // fails with SQLSTATE 22P02 before it ever reaches DecodeStoredPayload),
 // so that error branch is genuinely unreachable via SQL-level corruption
 // on this backend, not an untested gap.
+
+// BenchmarkPostgresAuditLog_Record_ChainConcurrency is this repo's
+// first-ever Benchmark* function (make bench previously built and passed
+// but exercised nothing), added to give the chainLockSubKey narrowing in
+// postgres.go's Record (see docs/architecture.md's "Postgres advisory-lock
+// chain scoping" section) something concrete to compare before/after: the
+// SameChain subbenchmark has every parallel goroutine write to one shared
+// chain (fully serialized by the advisory lock, same as before this
+// narrowing), CrossChain gives each goroutine its own chain (no
+// serialization between them since Stage 2). This is a manually-run
+// comparison, not a CI gate — no assertion here would be meaningful, since
+// relative throughput depends on the machine and Postgres instance running
+// it. Run with:
+//
+//	go test -run '^$' -bench BenchmarkPostgresAuditLog_Record_ChainConcurrency -benchmem -benchtime=3s .
+func BenchmarkPostgresAuditLog_Record_ChainConcurrency(b *testing.B) {
+	if _, err := newPostgresLog(); err != nil {
+		b.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+
+	b.Run("SameChain", func(b *testing.B) {
+		log, err := newPostgresLog()
+		if err != nil {
+			b.Fatalf("newPostgresLog: %v", err)
+		}
+		defer log.Close()
+		ctx := context.Background()
+
+		var n int64
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				id := atomic.AddInt64(&n, 1)
+				if _, err := log.Record(ctx, AuditEvent{
+					ChainID: testChainID, ActorID: "bench", EntityType: "t", EntityID: fmt.Sprintf("%d", id), Action: "create",
+				}); err != nil {
+					b.Fatalf("Record: %v", err)
+				}
+			}
+		})
+	})
+
+	b.Run("CrossChain", func(b *testing.B) {
+		log, err := newPostgresLog()
+		if err != nil {
+			b.Fatalf("newPostgresLog: %v", err)
+		}
+		defer log.Close()
+		ctx := context.Background()
+
+		var n, worker int64
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			// Each parallel goroutine (RunParallel's own unit of work)
+			// gets its own chain, so no two goroutines ever contend for
+			// the same chainLockSubKey.
+			chainID := fmt.Sprintf("bench-chain-%d", atomic.AddInt64(&worker, 1))
+			for pb.Next() {
+				id := atomic.AddInt64(&n, 1)
+				if _, err := log.Record(ctx, AuditEvent{
+					ChainID: chainID, ActorID: "bench", EntityType: "t", EntityID: fmt.Sprintf("%d", id), Action: "create",
+				}); err != nil {
+					b.Fatalf("Record: %v", err)
+				}
+			}
+		})
+	})
+}

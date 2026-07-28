@@ -23,6 +23,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,21 +39,37 @@ import (
 //go:embed internal/postgresdb/schema.sql
 var postgresSchemaSQL string
 
-// chainLockKey is the constant pg_advisory_xact_lock key used to serialize
-// Record across every chain in this database — deliberately global, not
-// yet chain-scoped (see docs/architecture.md's "extension note," now
-// actioned): GetLastEntry/InsertEntry/ListEntriesInRange are all
-// chain_id-filtered, so a single global lock is strictly stronger than
-// required (it also serializes unrelated chains against each other) but
-// never incorrect — over-serialization is a throughput cost, not a
-// correctness gap. Narrowing this to a per-chain lock (via
-// pg_advisory_xact_lock's two-int32-argument form, keying the second
-// argument off a hash of chainID) is tracked as a separate, later
-// refinement — see docs/architecture.md. Scoped to a single transaction
-// (released automatically on commit/rollback) — distinct in purpose and
-// lifetime from grauditSchemaLockKey below, which guards schema
-// application at connect time, not per-Record serialization.
-const chainLockKey int64 = 892374651
+// chainLockKey is the first argument to Record's pg_advisory_xact_lock(key1,
+// key2) call — the two-int32 overload, not the single-bigint one. key2 (see
+// chainLockSubKey) is what actually narrows serialization to one chain;
+// chainLockKey itself is just a fixed namespace shared by every chain, kept
+// as its own constant (rather than folded into the hash) so this library's
+// locks stay trivially distinguishable from an unrelated advisory lock
+// another tool might take against the same database. Scoped to a single
+// transaction (released automatically on commit/rollback) — distinct in
+// purpose and lifetime from grauditSchemaLockKey below, which guards schema
+// application at connect time, not per-Record serialization. See
+// docs/architecture.md's "Postgres advisory-lock chain scoping" section.
+const chainLockKey int32 = 892374651
+
+// chainLockSubKey deterministically derives Record's pg_advisory_xact_lock
+// key2 argument from chainID via FNV-1a (hash/fnv — deliberately not
+// hash/maphash, which is randomly reseeded per process specifically to
+// resist hash-flooding, so the same chainID would hash differently across
+// connections/processes and defeat the lock's entire purpose: two writers
+// on the same chain must agree on which key they're contending for). A
+// collision between two different chainIDs' hashes only costs extra,
+// harmless serialization — chain_id remains the authoritative filter in
+// every query regardless of lock granularity — never corruption; an
+// accepted, low-severity trade-off given chainID values are
+// tenant-provisioning-assigned, not raw adversarial end-user input (the
+// same "document, don't guard" convention already used for probeDocID and
+// grauditSchemaLockKey's own collision risk).
+func chainLockSubKey(chainID string) int32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(chainID)) // hash.Hash.Write on an in-memory FNV hash never returns an error
+	return int32(h.Sum32())         //nolint:gosec // deliberate bit-reinterpretation for a lock key, not a numeric value — see chainLockSubKey's own doc comment
+}
 
 // grauditSchemaLockKey is a fixed Postgres advisory-lock key used by
 // applyPostgresSchema to serialize schema application across concurrent
@@ -252,9 +269,10 @@ func (a *postgresAuditLog) Record(ctx context.Context, event AuditEvent) (EntryI
 	var recorded AuditEvent
 	err = pgx.BeginFunc(ctx, a.pool, func(tx pgx.Tx) error {
 		// Advisory lock scoped to this one transaction; released
-		// automatically on commit/rollback. A single constant key: one
-		// global chain in v1, no per-tenant sub-chains.
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", chainLockKey); err != nil {
+		// automatically on commit/rollback. The two-int32 form serializes
+		// only Record calls on the same chain against each other — see
+		// chainLockKey/chainLockSubKey's own doc comments.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)", chainLockKey, chainLockSubKey(event.ChainID)); err != nil {
 			return err
 		}
 
