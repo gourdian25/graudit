@@ -113,51 +113,83 @@ matching grcache's and gourdiantoken's own test connection strings exactly.
   `PublishRecorded` — the grevents integration every backend calls once);
   `docs.go` (package godoc only). All stdlib-only except `events.go` and
   each backend file (see below).
+- **Multi-chain support** — every `Record`/`RecordChange`/`Verify`/`Query`
+  call is scoped by a mandatory `ChainID` (first field on `AuditEvent`,
+  leading parameter on `RecordChange`/`Verify`, required field on
+  `QueryFilter`), so one `AuditLog` instance (one connection pool) serves
+  any number of independent hash chains — `EntryID` sequences and
+  `PrevHash` linkage are tracked per `ChainID`, not globally. There is no
+  wildcard/query-all escape hatch: an empty `ChainID` fails loud
+  (`ErrChainIDRequired`) on every backend rather than silently matching
+  every chain. `ChainID` is baked into `ComputeHash`'s preimage as the
+  first field (not just a storage/filter column) to prevent a
+  chain-splice attack — see `docs/architecture.md`'s "Multi-chain support"
+  section for the full rationale.
 - **`memory.go`** (`memoryAuditLog`) — test/dev only, never for anything
   you need to keep. A single `sync.Mutex` is both the storage guard and
-  the chain's serialization point. Takes functional options
+  the chain's serialization point (per-chain tail state lives in a
+  `map[string]*memoryChainTail`). Takes functional options
   (`MemoryOption`: `WithLogger`, `WithEventBus`), not a Config struct.
 - **`postgres.go`** (`postgresAuditLog`) — production-eligible, via pgx/v5
   with sqlc-generated queries (see `internal/postgresdb`, generated from
   `internal/postgresdb/schema.sql`/`queries/audit.sql` via `sqlc generate`
   — never hand-edit generated files), replacing an earlier GORM
-  implementation. Chain serialization is a `pg_advisory_xact_lock` held
-  for the transaction that reads the tail and inserts the new entry;
-  `EntryID` is explicitly assigned inside that transaction, **never** a
-  `BIGSERIAL` column (a sequence advances even on rollback, silently
-  creating a gap that would be indistinguishable from tampering). Schema
-  is applied on connect via an embedded `//go:embed` schema string,
-  serialized by a *separate* Postgres advisory lock
+  implementation. Chain serialization is a `pg_advisory_xact_lock(key1,
+  key2)` held for the transaction that reads the tail and inserts the new
+  entry — `key1` is the fixed `chainLockKey` namespace, `key2` is an
+  FNV-1a 32-bit hash (`chainLockSubKey`, `hash/fnv`) of the `chainID`, so
+  unrelated chains' writes don't serialize against each other while
+  same-chain writes still fully serialize; `EntryID` is explicitly
+  assigned inside that transaction, **never** a `BIGSERIAL` column (a
+  sequence advances even on rollback, silently creating a gap that would
+  be indistinguishable from tampering). The primary key is `(chain_id,
+  entry_id)`. Schema is applied on connect via an embedded `//go:embed`
+  schema string, serialized by a *separate* Postgres advisory lock
   (`grauditSchemaLockKey`, distinct from the per-Record `chainLockKey`).
+  `PostgresConfig` accepts exactly one of `DSN` (dials its own pool) or
+  `Pool` (reuses an already-open `*pgxpool.Pool` the caller owns, e.g.
+  shared across hundreds of tenant chains) — resolved by the
+  `connectPostgres` helper, mirroring grnoti's own
+  `PostgresConfig.Pool`/`connectPostgres`/`ownsPool` pattern; `Close()`
+  only closes the pool when this `AuditLog` dialed it itself.
 - **`mongo.go`** (`mongoAuditLog`) — production-eligible, via
   `go.mongodb.org/mongo-driver` **v1** (not `/v2` — breaking rewrite, out
   of scope). Chain serialization is a multi-document ACID transaction
   (`session.WithTransaction`) covering a singleton chain-state document
-  (`<collection>_chain_state`) and the new entry's insert. No TTL index
-  anywhere — unlike `grcache`'s Mongo backend, audit entries are never
-  expired. This file was previously the standalone `graudit/mongostore`
-  package (renamed away from the bare `mongo` name only because it
-  collided with the upstream driver's own `package mongo` for a consumer
-  importing both in the same file); as a file within one flat package
-  rather than a separate importable package, that collision no longer
-  applies, so the shorter `mongo` name (file name and error-message
-  prefix) is safe again — matching grcache's own `mongostore` → `mongo`
-  reversion during its own flattening.
+  (`_id` = the real `chainID` string, one document per chain) and the new
+  entry's insert — no lock needed at all, since concurrent `Record` calls
+  on different chains touch disjoint chain-state documents and never
+  trigger transaction-conflict retries against each other. The unique
+  index is compound `{chainId:1, entryId:1}`. No TTL index anywhere —
+  unlike `grcache`'s Mongo backend, audit entries are never expired. This
+  file was previously the standalone `graudit/mongostore` package
+  (renamed away from the bare `mongo` name only because it collided with
+  the upstream driver's own `package mongo` for a consumer importing both
+  in the same file); as a file within one flat package rather than a
+  separate importable package, that collision no longer applies, so the
+  shorter `mongo` name (file name and error-message prefix) is safe again
+  — matching grcache's own `mongostore` → `mongo` reversion during its own
+  flattening.
 - **`contract_audit_test.go`** — the shared behavioral test suite
   (`runAuditContract`, run via `TestAuditLog_Contract`'s per-backend
   subtests: `Memory`/`Postgres`/`Mongo`, each skipping gracefully if its
   live service isn't reachable). This was originally a separate,
   publicly-importable `conformance` package — folded into the root
   package's own tests for ecosystem consistency; see
-  `docs/architecture.md`'s closing section. 11 scenarios per backend,
-  including the two most important tests in the repo:
-  `ConcurrentRecordStress` (proves the serialization strategy actually
-  works under real concurrent `Record()` calls) and `VerifyDetectsTamper`
-  (proves `Verify()`'s Check-A tamper-detection claim against a
-  backend-specific `withTamperHook` that bypasses the API entirely — raw
-  SQL for postgres, raw driver call for mongo, direct struct mutation for
-  memory). `Verify()`'s *other* check (Check B, chain-linkage integrity)
-  is proven separately per backend in `internal_coverage_test.go`'s
+  `docs/architecture.md`'s closing section. 14 scenarios per backend,
+  including the most important tests in the repo:
+  `ConcurrentRecordStress`/`ConcurrentRecordStressMultiChain` (prove the
+  serialization strategy actually works under real concurrent `Record()`
+  calls, single-chain and interleaved-across-chains respectively),
+  `VerifyDetectsTamper` (proves `Verify()`'s Check-A tamper-detection
+  claim against a backend-specific `withTamperHook` that bypasses the API
+  entirely — raw SQL for postgres, raw driver call for mongo, direct
+  struct mutation for memory), and `ChainIsolation`/
+  `ChainIsolationTamperContainment` (prove chains never leak into each
+  other via `Verify`/`Query`, and that tampering one chain never affects
+  another's `Verify` result). `Verify()`'s *other* check (Check B,
+  chain-linkage integrity) is proven separately per backend in
+  `internal_coverage_test.go`'s
   `Test<Backend>AuditLog_VerifyDetectsChainLinkageBreak` tests, since the
   contract suite's tamper hook only ever corrupts `Payload`, not
   `PrevHash`.

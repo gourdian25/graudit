@@ -70,7 +70,7 @@ gotcha (see decision #11 below).
 | Stage 1 | Core multi-chain support (hash, interface, all 3 backends, schema/queries, test retrofit + isolation tests) | ✅ Done |
 | Stage 2 | Postgres advisory-lock chain-scoping (performance only, no behavior change) | ✅ Done |
 | Stage 3 | `PostgresConfig.Pool` injection (mirrors grnoti) | ✅ Done |
-| Stage 4 | Docs / CHANGELOG / version bump / example.go | Not started |
+| Stage 4 | Docs / CHANGELOG / version bump / example.go | ✅ Done |
 | Stage 5 | Full validation pass | Not started |
 
 ## Design decisions locked in for the executor
@@ -602,6 +602,80 @@ Last, once the API surface from Stages 1–3 is final.
 
 **Verification:** `go run ./example` succeeds end-to-end against the
 memory backend; `bark check` reports no header debris on touched files.
+
+### Stage 4 completion notes
+
+Implemented as planned, plus one addition made at the user's explicit
+request mid-stage (not in the original plan): two Mermaid diagrams added
+to `README.md`'s new "How it works" section — a `sequenceDiagram` for the
+`Record` flow (tail read → `ComputeHash` → insert → best-effort
+`PublishRecorded`) and a `flowchart` of one chain's hash linkage
+(`Genesis → Entry1 → Entry2 → Entry3`, annotated with what `Verify` checks
+at each link) — plus a third small `flowchart` inside the existing
+"Multi-chain support" section depicting one `AuditLog`/pool fanning out to
+several independent `ChainID`s over shared storage. GitHub renders
+` ```mermaid ` fences natively, so no dependency was added.
+
+- **`example/example.go`**: rewritten around two chains
+  (`tenant:acme`, `platform:ops`) on one `graudit.NewMemoryAuditLog`
+  instance, demonstrating `Record`/`RecordChange` on the tenant chain, a
+  direct `Record` on the platform chain, and `Verify`/`Query` scoped to
+  each independently — explicitly printing both chains' `EntryID`s to make
+  the "independent sequences, both starting at 1" property visible when
+  run. The commented Postgres/Mongo block at the bottom gained a third
+  snippet demonstrating `PostgresConfig.Pool` injection (Stage 3) with a
+  short comment on why it matters at multi-tenant scale. Ran end-to-end
+  (`go run ./example`) — output confirms both chains' `Verify` pass and
+  the platform chain's first entry is `EntryID 1` despite the tenant
+  chain already being at `EntryID 2`.
+- **`docs.go`**: "Key Features" gained a multi-chain bullet and the
+  `ComputeHash`/`Verify` bullets were reworded for `ChainID`; "Getting
+  Started" snippet gained `ChainID`; new "Multi-chain Support" godoc
+  section added (mirroring the plan's intent, placed between "Getting
+  Started" and "Backends"); the Postgres "Backends" bullet gained a
+  `PostgresConfig.Pool` mention; "Verify() Semantics" snippet updated to
+  `Verify(ctx, chainID, 1, latestID)`.
+- **`README.md`**: Quickstart snippet gained `ChainID`; new "Multi-chain
+  support" section (prose + code + the fan-out diagram above); Backends
+  code block gained the `Pool`-injection variant; `Verify()` semantics
+  snippet updated; Testing section's coverage number updated to 95.5%;
+  the `make bench` paragraph rewritten now that a real benchmark exists
+  (Stage 2's `BenchmarkPostgresAuditLog_Record_ChainConcurrency`); the
+  contract-suite description mentions the new isolation/tamper-containment
+  scenarios. One incidental fix made while touching the adjacent text: the
+  "Why this shape" section referenced CHANGELOG.md's `[Unreleased]`
+  entry, which hasn't existed since `[0.3.0]` was cut — corrected to
+  `[0.3.0]`.
+- **`CHANGELOG.md`**: new `## [0.4.0] - 2026-07-28` entry (Added/Changed/
+  Migration/Testing subsections), covering every breaking change
+  (`ChainID` additions, `ComputeHash`/`BuildChangeEvent` signature
+  changes, `QueryFilter.ChainID` required), the new sentinel, the Postgres
+  lock-scoping refinement, `PostgresConfig.Pool` (additive), and the two
+  manual operator migration steps from decision #10, matching the
+  `[0.3.0]` entry's structure and level of detail.
+- **`version.go`**: `Version` `"v0.3.0"` → `"v0.4.0"`.
+- **`CLAUDE.md`**: Architecture section gained a new standalone
+  "Multi-chain support" bullet (placed right after the root-package
+  bullet, before `memory.go`, since it's a cross-cutting concern rather
+  than one file's concern); `memory.go`/`postgres.go`/`mongo.go` bullets
+  updated for `memoryChainTail`, the two-`int32` advisory lock +
+  `chainLockSubKey`, `PostgresConfig.Pool`/`connectPostgres`/`ownsPool`,
+  and the Mongo chain-state-keyed-by-`chainID` design respectively;
+  `contract_audit_test.go` bullet's scenario count updated 11 → 14 and now
+  names `ConcurrentRecordStressMultiChain`/`ChainIsolation`/
+  `ChainIsolationTamperContainment` alongside the pre-existing headline
+  tests. No Commands-section change ended up needed beyond what Stage 2
+  already added (the plan's "if Stage 2 adds a benchmark worth naming"
+  condition was already satisfied and documented in Stage 2's own
+  completion notes).
+
+**Verification results:** `go build ./...`, `go vet ./...`, `gofmt -l .`
+all clean. `go run ./example`: succeeds, output confirms per-chain
+`EntryID` isolation and both `Verify` calls pass. `bark check`: clean (no
+`.go` files were touched in this stage besides `version.go`, which kept
+its header). Re-ran the full suite for safety even though this was a
+docs-only stage code-wise: `go test -race -timeout 5m .` green,
+`golangci-lint run ./...` 0 issues, `make coverage-check` steady at 95.5%.
 
 ## Stage 5 — Full validation pass
 

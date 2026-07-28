@@ -5,6 +5,110 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-28
+
+Multi-chain support: one `AuditLog` instance (one connection pool) can now
+serve any number of independent hash chains — e.g. one per tenant in a
+multi-tenant deployment, plus a separate chain for platform-operator
+actions — instead of exactly one global chain per instance. Also adds
+`PostgresConfig.Pool` injection. Contains **breaking changes** (allowed
+pre-1.0); confirmed no existing graudit-backed deployment needed to be
+preserved across this release (see
+`docs/plan/multi-chain-support-plan.md`).
+
+### Added
+
+- **`ChainID`** is now a required field/parameter throughout the public
+  API: `AuditEvent.ChainID` (first field), `QueryFilter.ChainID`,
+  `RecordChange(ctx, chainID, actorID, entityType, entityID, before,
+  after)`, `Verify(ctx, chainID, from, to)`. `EntryID` sequences and
+  `PrevHash` linkage are now tracked per `ChainID`, not globally. There is
+  no wildcard/query-all escape hatch — an empty `ChainID` fails loud
+  (`ErrChainIDRequired`) rather than silently matching every chain, since
+  a cross-tenant leak in an audit trail is worse than the ergonomic cost
+  of always specifying one chain. See
+  [docs/architecture.md](docs/architecture.md)'s "Multi-chain support"
+  section.
+- New sentinel `ErrChainIDRequired`, returned (dual-wrapped with
+  `ErrInvalidEvent` from `Record`'s `Validate()` path) whenever a
+  `ChainID`/`chainID` is empty.
+- **`PostgresConfig.Pool`** — an already-open `*pgxpool.Pool` can now be
+  supplied instead of `DSN`, letting graudit share a pool the rest of the
+  application already owns rather than dialing its own per `AuditLog`
+  instance. Exactly one of `DSN`/`Pool` is required. graudit never closes
+  a pool it didn't dial itself (`Close()` is a no-op on the pool when
+  `Pool` was supplied). Mirrors grnoti's own `PostgresConfig.Pool`.
+- This repo's first `Benchmark*` function,
+  `BenchmarkPostgresAuditLog_Record_ChainConcurrency`, comparing
+  concurrent `Record` throughput on one shared chain against many
+  independent chains.
+
+### Changed
+
+- **Breaking:** `ComputeHash` (exported) gains a new leading `chainID
+  string` parameter, included first in the hash preimage. This is not
+  cosmetic: without `chainID` in the preimage, an attacker with direct
+  database access could rewrite one entry's `chain_id` column — splicing
+  it from one chain into another — without invalidating its stored
+  `Hash`, since `EntryID` sequences independently restart at 1 in every
+  chain and two entries from different chains could otherwise share an
+  identical `(EntryID, ActorID, EntityType, EntityID, Action, Payload,
+  Timestamp, PrevHash)` tuple. `GenesisPrevHash` did not need to become
+  chain-specific for the same reason: `chainID` is in every entry's
+  preimage including entry #1's, so two chains' genesis entries sharing
+  that one well-known `PrevHash` constant still hash differently.
+- **Breaking:** `BuildChangeEvent` (exported) gains a new leading
+  `chainID string` parameter.
+- **Breaking:** `QueryFilter.ChainID` is now required — previously a
+  zero-value `QueryFilter` matched every entry; now `Query`/`Verify` both
+  return `ErrChainIDRequired` for an empty `ChainID`/`chainID` on every
+  backend.
+- Postgres: `Record`'s `pg_advisory_xact_lock` narrowed from a single
+  global key to Postgres's two-`int32` `pg_advisory_xact_lock(key1, key2)`
+  overload — `key1` stays the fixed `chainLockKey` namespace, `key2` is an
+  FNV-1a 32-bit hash of `chainID` — so concurrent `Record` calls on
+  different chains no longer serialize against each other; same-chain
+  calls still fully serialize as before. See
+  [docs/architecture.md](docs/architecture.md)'s "Postgres advisory-lock
+  chain scoping" section.
+- Schema: `internal/postgresdb/schema.sql`'s `graudit_entries` table gains
+  a `chain_id TEXT NOT NULL` column; the primary key becomes `(chain_id,
+  entry_id)`; the `actor`/`entity`/`timestamp` indexes become composite
+  with a leading `chain_id`.
+- Mongo: `entryDocument` gains a `chainId` field; the unique index becomes
+  compound `{chainId:1, entryId:1}`; the other three indexes gain a
+  leading `chainId` component; each chain's chain-state singleton
+  document is now keyed by the real `chainID` string instead of a fixed
+  `"tail"` sentinel.
+
+### Migration (only if upgrading an existing pre-0.4.0 deployment)
+
+No automated migration tooling ships with this release, matching the
+`[0.3.0]` precedent — greenfield deployments need no action.
+
+- **Postgres:** there is no `ALTER TABLE` path — `CREATE TABLE IF NOT
+  EXISTS` no-ops against an existing, differently-shaped `graudit_entries`
+  table. An existing deployment needs manual recreation (export any data
+  you need to keep first).
+- **Mongo:** the legacy unique index `{entryId:1}` must be manually
+  dropped (`db.graudit_entries.dropIndex("entryId_1")`) before upgrading —
+  left in place alongside the new compound `{chainId:1, entryId:1}` index,
+  it would incorrectly reject every second chain's `entryId=1`.
+  `ensureAuditIndexes` deliberately does not auto-detect and drop this
+  index itself, since an unconditional drop would error against a fresh
+  deployment where the index never existed.
+
+### Testing
+
+- Coverage: 95.5% on the root package (up from 95.2%).
+- `contract_audit_test.go` gained three new scenarios run against all
+  three backends: `ChainIsolation` (two chains on one instance, each
+  `EntryID` sequence independently starting at 1, no cross-chain leakage
+  via `Verify`/`Query`), `ChainIsolationTamperContainment` (tampering one
+  chain must never affect another chain's `Verify` result), and
+  `ConcurrentRecordStressMultiChain` (concurrent `Record` calls
+  interleaved across chains stay gap-free/duplicate-free per chain).
+
 ## [0.3.0] - 2026-07-23
 
 Ecosystem-wide Stage 3 pass: flattened to a single package, GORM removed,
