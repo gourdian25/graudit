@@ -71,7 +71,7 @@ gotcha (see decision #11 below).
 | Stage 2 | Postgres advisory-lock chain-scoping (performance only, no behavior change) | ✅ Done |
 | Stage 3 | `PostgresConfig.Pool` injection (mirrors grnoti) | ✅ Done |
 | Stage 4 | Docs / CHANGELOG / version bump / example.go | ✅ Done |
-| Stage 5 | Full validation pass | Not started |
+| Stage 5 | Full validation pass | ✅ Done |
 
 ## Design decisions locked in for the executor
 
@@ -699,3 +699,89 @@ contract run → `go run ./example` → `bark check`.
 - `contract_audit_test.go` — the shared behavioral suite every backend
   runs through; the three new isolation/stress scenarios are the plan's
   primary correctness evidence
+
+### Stage 5 completion notes
+
+Full validation pass, run in the order the plan specifies.
+
+**Fresh-database step (the one genuinely destructive-adjacent action in
+this stage):** rather than tearing down and recreating the shared
+`gourdian-postgres`/`gourdian-mongo-auth` Docker containers themselves
+(which grnoti/grcache/gourdiantoken also test against, each in its own
+database — recreating the containers would have been unnecessarily
+disruptive to their state), only graudit's own `graudit_test` database was
+dropped and recreated in each: `DROP DATABASE graudit_test; CREATE
+DATABASE graudit_test` via `docker exec gourdian-postgres psql`, and
+`db.getSiblingDB("graudit_test").dropDatabase()` via `docker exec
+gourdian-mongo-auth mongosh`. This achieves the plan's actual goal (catch
+any residual `CREATE TABLE IF NOT EXISTS` staleness against a database
+that predates the `chain_id` schema change) without touching any sibling
+repo's data. In practice this is close to redundant with what already
+happens on every single test run — `truncatePostgresTestDB`/
+`dropMongoTestDB` (Stage 1's decision #11 fix) already drop-and-recreate
+per test-suite invocation — but running it once explicitly at the
+database level before the full pass matches the plan's literal wording
+and removed any doubt.
+
+**Verification results, run against the freshly recreated databases (used
+`-count=1` where relevant to defeat Go's test cache, since a cached `ok`
+would not actually re-hit the freshly recreated databases):**
+
+- `make vet`, `make lint`: clean, 0 issues. (`make fmt` was skipped — `gofmt
+  -l .` had already confirmed nothing needed formatting, and `make fmt`
+  runs `go fmt ./...` unconditionally, which would rewrite files for no
+  reason.)
+- `go test -race -count=1 -timeout 5m ./...`: **ok**, 8.0s, actually
+  re-executed (not cache-served) against the fresh databases.
+- `make coverage-check`: **95.5%**, steady.
+- `make bench`: `BenchmarkPostgresAuditLog_Record_ChainConcurrency` —
+  `SameChain` 353,076 ns/op vs. `CrossChain` 173,469 ns/op (~2.0x), a
+  second independent measurement consistent with Stage 2's original
+  381,373 vs. 174,909 ns/op finding.
+- Full live contract run, verbose
+  (`go test -run TestAuditLog_Contract -race -count=1 -v .`): all 14
+  scenarios × 3 backends (42 subtests total) ran live — none skipped,
+  confirming both Postgres and Mongo were actually reachable and exercised,
+  not silently falling back to `t.Skipf` — and all passed.
+- `go run ./example`: succeeds; output confirms the tenant chain reaches
+  `EntryID 2` while the platform chain's first entry is independently
+  `EntryID 1`, and both `Verify` calls report `ok=true`.
+- `bark check`: clean, 28 files current.
+
+**Doc-accuracy cross-check (the user's explicit ask for this stage, beyond
+the plan's literal checklist):** every technical claim added across
+Stages 1–4's documentation was individually grep-verified against the
+actual current code (`ComputeHash`/`BuildChangeEvent`/`RecordChange`/
+`Verify` signatures, `chainLockKey`/`chainLockSubKey`, `connectPostgres`'s
+signature, `ownsPool`, `memoryChainTail`, Mongo's `chainId` bson tag and
+index list, `ErrChainIDRequired`, `AuditEvent`/`QueryFilter` field
+presence) — all matched. `contract_audit_test.go`'s actual `t.Run` names
+were enumerated and counted: 14 per-backend scenarios, matching
+`CLAUDE.md`'s stated count exactly. Two real staleness bugs were found and
+fixed in this pass, both outside what Stage 4's own completion notes had
+claimed was already correct:
+
+1. **`CLAUDE.md`'s Commands section** still read "no `Benchmark*` funcs
+   exist yet — builds/passes but times nothing" for `make bench`, even
+   though Stage 2 added a real one. Stage 4's own completion notes had
+   claimed "no Commands-section change ended up needed... already
+   satisfied [in] Stage 2's own completion notes" — that claim was wrong;
+   Stage 2 updated `docs/architecture.md` and `README.md` but missed this
+   specific line in `CLAUDE.md`. Fixed: now describes
+   `BenchmarkPostgresAuditLog_Record_ChainConcurrency` and its
+   SameChain/CrossChain comparison.
+2. **`docs/architecture.md`** had zero mentions of `PostgresConfig.Pool`
+   anywhere, despite Stage 3 adding it and this file existing specifically
+   to record deliberate architectural divergences — the "Constructor
+   shape" section described `PostgresConfig` as if `DSN` were its only
+   connection option. Fixed: added a paragraph documenting the
+   `DSN`-xor-`Pool` validation, the `connectPostgres`/`ownsPool` pattern,
+   and why it exists (multi-chain deployments sharing one pool across many
+   tenant chains), explicitly noting it mirrors grnoti's own pattern.
+
+Both fixes were re-verified with a final `go build ./...`, `go vet ./...`,
+`gofmt -l .`, and `bark check` pass — all clean.
+
+**All five stages of this plan are now complete.** Per the user's
+instruction, work pauses here for review before the
+`dev#manish#multi_chain_support` branch is moved into `dev` for cleanup.

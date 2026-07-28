@@ -241,6 +241,20 @@ renamed from the pre-flatten `Option` to avoid an overly generic
 root-package-level name now that all three backends share one package),
 since it has no connection details to configure.
 
+`PostgresConfig` additionally accepts exactly one of `DSN` (dial a new
+`pgxpool.Pool`) or `Pool` (reuse an already-open one the caller owns),
+validated via `(cfg.DSN == "") == (cfg.Pool == nil)` in the shared
+`connectPostgres` helper — mirroring grnoti's own
+`PostgresConfig.Pool`/`connectPostgres`/`ownsPool` pattern exactly, added
+specifically for multi-chain deployments where a single process serves
+many tenant chains and shouldn't open one dedicated connection pool per
+`AuditLog` instance to do it. `postgresAuditLog.ownsPool` records whether
+`connectPostgres` dialed the pool itself (`true`, DSN path) or received it
+externally (`false`, `Pool` path) — `Close()` only closes the pool in the
+former case, since a pool the caller supplied may still be in use
+elsewhere. Mongo and memory have no equivalent injection point (not
+requested).
+
 ## No Redis/memcached backend
 
 The original plan doc's own reasoning for excluding cache-backed storage

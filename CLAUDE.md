@@ -32,7 +32,7 @@ make race             # go test -race ./...  (mandatory before any commit touchi
 make coverage         # HTML coverage report
 make coverage-summary # coverage by function (go tool cover -func)
 make coverage-check   # verify the root package meets 95% coverage
-make bench            # go test -bench=. -benchmem -benchtime=10s ./...  (no Benchmark* funcs exist yet — builds/passes but times nothing)
+make bench            # go test -bench=. -benchmem -benchtime=10s ./...  (runs BenchmarkPostgresAuditLog_Record_ChainConcurrency, requires live Postgres; SameChain vs. CrossChain Record throughput, not CI-gated)
 make lint             # golangci-lint run ./...
 make vet              # go vet ./...
 make fmt              # gofmt
