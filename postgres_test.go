@@ -285,12 +285,14 @@ func TestPostgresAuditLog_RecordChange_InvalidPayload(t *testing.T) {
 }
 
 // Note: there is no postgres equivalent of the mongo backend's
-// TestMongoAuditLog_Query_InvalidStoredPayload — the payload column is
-// jsonb, and Postgres itself rejects syntactically invalid JSON at the
-// type level on write (confirmed: a raw UPDATE with a non-JSON string
-// fails with SQLSTATE 22P02 before it ever reaches DecodeStoredPayload),
-// so that error branch is genuinely unreachable via SQL-level corruption
-// on this backend, not an untested gap.
+// TestMongoAuditLog_Query_InvalidStoredPayload (or its GetEntry
+// counterpart, TestMongoAuditLog_GetEntry_InvalidStoredPayload) — the
+// payload column is jsonb, and Postgres itself rejects syntactically
+// invalid JSON at the type level on write (confirmed: a raw UPDATE with a
+// non-JSON string fails with SQLSTATE 22P02 before it ever reaches
+// DecodeStoredPayload), so that error branch is genuinely unreachable via
+// SQL-level corruption on this backend — in both Query and GetEntry — not
+// an untested gap.
 
 // BenchmarkPostgresAuditLog_Record_ChainConcurrency is this repo's
 // first-ever Benchmark* function (make bench previously built and passed

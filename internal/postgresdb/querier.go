@@ -10,6 +10,7 @@ import (
 )
 
 type Querier interface {
+	GetEntryByID(ctx context.Context, arg GetEntryByIDParams) (GrauditEntry, error)
 	// File: internal/postgresdb/queries/audit.sql
 	GetLastEntry(ctx context.Context, chainID string) (GrauditEntry, error)
 	InsertEntry(ctx context.Context, arg InsertEntryParams) error

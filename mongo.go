@@ -337,6 +337,24 @@ func (a *mongoAuditLog) RecordChange(ctx context.Context, chainID, actorID, enti
 	return a.Record(ctx, event)
 }
 
+// resolveLatestEntryID looks up chainID's current tail EntryID from its
+// chain-state singleton document — the same lookup Record uses to resolve
+// the tail before appending — shared by LatestEntryID and Verify's to==0
+// ("verify through latest") resolution. Returns a bare (unwrapped)
+// ErrEntryNotFound for an empty chain or ErrBackendUnavailable for a
+// genuine query failure; callers add their own "graudit: ..." prefix.
+func (a *mongoAuditLog) resolveLatestEntryID(ctx context.Context, chainID string) (EntryID, error) {
+	var tail mongoChainState
+	err := a.chainColl.FindOne(ctx, bson.M{"_id": chainID}).Decode(&tail)
+	switch {
+	case errors.Is(err, mongo.ErrNoDocuments):
+		return 0, ErrEntryNotFound
+	case err != nil:
+		return 0, ErrBackendUnavailable
+	}
+	return EntryID(tail.LastEntryID), nil
+}
+
 // Verify applies the same two-check design as graudit's postgres backend:
 // Check A recomputes each entry's hash from its own stored fields and
 // compares against its stored Hash; Check B asserts each entry's stored
@@ -350,6 +368,17 @@ func (a *mongoAuditLog) Verify(ctx context.Context, chainID string, from, to Ent
 	}
 	if from < 1 {
 		from = 1
+	}
+
+	if to == 0 {
+		latest, err := a.resolveLatestEntryID(ctx, chainID)
+		switch {
+		case errors.Is(err, ErrEntryNotFound):
+			return true, VerifyResult{Valid: true, Empty: true}, nil
+		case err != nil:
+			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
+		}
+		to = latest
 	}
 
 	cursor, err := a.entries.Find(ctx,
@@ -452,6 +481,53 @@ func (a *mongoAuditLog) Query(ctx context.Context, filter QueryFilter) ([]AuditE
 		out = append(out, event)
 	}
 	return out, nil
+}
+
+// GetEntry implements AuditLog.GetEntry; see the interface's doc comment
+// for the full contract. Backed by a direct FindOne on {chainId, entryId}
+// — already the entries collection's compound unique index (see
+// ensureAuditIndexes), so this is an indexed lookup, not a collection scan.
+func (a *mongoAuditLog) GetEntry(ctx context.Context, chainID string, id EntryID) (AuditEvent, error) {
+	if a.closed.Load() {
+		return AuditEvent{}, ErrClosed
+	}
+	if chainID == "" {
+		return AuditEvent{}, ErrChainIDRequired
+	}
+
+	var doc entryDocument
+	err := a.entries.FindOne(ctx, bson.M{"chainId": chainID, "entryId": uint64(id)}).Decode(&doc)
+	switch {
+	case errors.Is(err, mongo.ErrNoDocuments):
+		return AuditEvent{}, ErrEntryNotFound
+	case err != nil:
+		return AuditEvent{}, fmt.Errorf("graudit: get entry: %w", ErrBackendUnavailable)
+	}
+
+	event, err := doc.toAuditEvent()
+	if err != nil {
+		return AuditEvent{}, fmt.Errorf("graudit: get entry: %w", err)
+	}
+	return event, nil
+}
+
+// LatestEntryID implements AuditLog.LatestEntryID; see the interface's doc
+// comment for the full contract. Reuses the chain-state singleton document
+// — the same one Record already reads to resolve the tail — rather than a
+// new lookup.
+func (a *mongoAuditLog) LatestEntryID(ctx context.Context, chainID string) (EntryID, error) {
+	if a.closed.Load() {
+		return 0, ErrClosed
+	}
+	if chainID == "" {
+		return 0, ErrChainIDRequired
+	}
+
+	latest, err := a.resolveLatestEntryID(ctx, chainID)
+	if err != nil {
+		return 0, fmt.Errorf("graudit: latest entry id: %w", err)
+	}
+	return latest, nil
 }
 
 // Close implements AuditLog.Close; idempotent via sync.Once.

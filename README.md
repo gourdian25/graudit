@@ -135,8 +135,8 @@ func main() {
 ```
 
 See [example/example.go](example/example.go) for a fuller runnable demo
-(`Record`, `RecordChange`, `Verify`, `Query`, two independent chains on one
-`AuditLog` instance).
+(`Record`, `RecordChange`, `Verify`, `Query`, `GetEntry`, `LatestEntryID`,
+two independent chains on one `AuditLog` instance).
 
 ## Multi-chain support
 
@@ -152,7 +152,7 @@ plus a separate chain for platform-operator actions — without opening one
 auditLog.Record(ctx, graudit.AuditEvent{ChainID: "tenant:acme", ActorID: "user:42", /* ... */})
 auditLog.Record(ctx, graudit.AuditEvent{ChainID: "platform:ops", ActorID: "operator:jane", /* ... */})
 
-ok, detail, err := auditLog.Verify(ctx, "tenant:acme", 1, latestID)
+ok, detail, err := auditLog.Verify(ctx, "tenant:acme", 1, 0) // to=0: verify through the latest entry
 ```
 
 ```mermaid
@@ -309,11 +309,13 @@ auditLog, err := graudit.NewMemoryAuditLog(graudit.WithLogger(logger))
 ## `Verify()` semantics
 
 ```go
-ok, detail, err := auditLog.Verify(ctx, chainID, 1, latestID)
+ok, detail, err := auditLog.Verify(ctx, chainID, 1, 0) // to=0: through the latest entry
 if err != nil {
 	// operational failure — could not even attempt verification
 }
-if !ok {
+if detail.Empty {
+	// chainID has no entries recorded yet — not a tampering signal
+} else if !ok {
 	log.Printf("tampering detected at entry %d: expected %s, got %s",
 		detail.BrokenAt, detail.Expected, detail.Actual)
 }
@@ -323,6 +325,29 @@ if !ok {
 one recomputed from its own stored fields, and that each entry's stored
 `PrevHash` matches the immediately preceding entry's stored hash. See
 [docs/architecture.md](docs/architecture.md) for why both are needed.
+
+`to`'s zero value is a sentinel meaning "verify through `chainID`'s current
+latest entry" (the same position `LatestEntryID` returns) — not "zero
+rows." `VerifyResult.Empty` is `true` only when `chainID` genuinely has no
+entries recorded at all, so a caller doing "verify everything" can tell
+that apart from a real full-chain pass (both otherwise report `ok=true`).
+Pass an explicit non-zero `to` for a specific historical sub-range instead.
+
+## `GetEntry()` and `LatestEntryID()`
+
+```go
+entry, err := auditLog.GetEntry(ctx, chainID, 42) // fetch entry #42 directly
+latest, err := auditLog.LatestEntryID(ctx, chainID) // resolve the chain's tail
+```
+
+`GetEntry` fetches one entry by its `EntryID` via a direct indexed/keyed
+lookup on every backend — O(1), never a `Query` call followed by a linear
+scan. `LatestEntryID` resolves a chain's current tail `EntryID` — the same
+position `Verify`'s `to=0` sentinel resolves to internally — useful on its
+own when a caller wants the tail without also running a full `Verify`.
+Both return `graudit.ErrEntryNotFound` (no such id / chain has no entries
+yet) alongside the usual `ErrChainIDRequired`/`ErrClosed`/
+`ErrBackendUnavailable` sentinels every other method uses.
 
 ## Testing
 

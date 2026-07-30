@@ -98,8 +98,11 @@ func main() {
 	fmt.Println("recorded platform entry", platformID1)
 
 	// Verify confirms each chain hasn't been tampered with — scoped
-	// independently per chain, never across them.
-	tenantOK, tenantDetail, err := auditLog.Verify(ctx, tenantChainID, 1, tenantID2)
+	// independently per chain, never across them. to=0 is a sentinel
+	// meaning "through the current latest entry" rather than "zero rows",
+	// so this verifies the tenant chain's entire history without having to
+	// track its tail ID separately.
+	tenantOK, tenantDetail, err := auditLog.Verify(ctx, tenantChainID, 1, 0)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -110,6 +113,22 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Printf("verify platform chain (before tampering): ok=%v detail=%+v\n", platformOK, platformDetail)
+
+	// GetEntry fetches one entry by its position directly — O(1) on every
+	// backend, never a Query call followed by a linear scan.
+	tenantEntry1, err := auditLog.GetEntry(ctx, tenantChainID, tenantID1)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("fetched tenant entry #%d directly: action=%q entity=%s/%s\n", tenantEntry1.ID, tenantEntry1.Action, tenantEntry1.EntityType, tenantEntry1.EntityID)
+
+	// LatestEntryID resolves a chain's current tail — the same position
+	// Verify's to=0 sentinel above resolved to internally.
+	tenantLatest, err := auditLog.LatestEntryID(ctx, tenantChainID)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("tenant chain's latest entry id:", tenantLatest)
 
 	// Query is likewise scoped by ChainID — required on every call, no
 	// wildcard/query-all escape hatch, since a cross-tenant leak in an

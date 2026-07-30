@@ -383,6 +383,22 @@ func (a *postgresAuditLog) RecordChange(ctx context.Context, chainID, actorID, e
 	return a.Record(ctx, event)
 }
 
+// resolveLatestEntryID looks up chainID's current tail EntryID via the same
+// GetLastEntry query Record uses to find the tail — shared by LatestEntryID
+// and Verify's to==0 ("verify through latest") resolution. Returns a bare
+// (unwrapped) ErrEntryNotFound for an empty chain or ErrBackendUnavailable
+// for a genuine query failure; callers add their own "graudit: ..." prefix.
+func (a *postgresAuditLog) resolveLatestEntryID(ctx context.Context, chainID string) (EntryID, error) {
+	last, err := a.q.GetLastEntry(ctx, chainID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, ErrEntryNotFound
+	case err != nil:
+		return 0, ErrBackendUnavailable
+	}
+	return pgEntryID(last.EntryID), nil
+}
+
 // Verify recomputes the hash chain across [from, to] via two checks per
 // entry: Check A recomputes each entry's hash from its own stored fields
 // and compares against its stored Hash; Check B asserts each entry's stored
@@ -398,6 +414,17 @@ func (a *postgresAuditLog) Verify(ctx context.Context, chainID string, from, to 
 	}
 	if from < 1 {
 		from = 1
+	}
+
+	if to == 0 {
+		latest, err := a.resolveLatestEntryID(ctx, chainID)
+		switch {
+		case errors.Is(err, ErrEntryNotFound):
+			return true, VerifyResult{Valid: true, Empty: true}, nil
+		case err != nil:
+			return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", err)
+		}
+		to = latest
 	}
 
 	rows, err := a.q.ListEntriesInRange(ctx, postgresdb.ListEntriesInRangeParams{ChainID: chainID, FromID: toPgEntryID(from), ToID: toPgEntryID(to)})
@@ -480,6 +507,50 @@ func (a *postgresAuditLog) Query(ctx context.Context, filter QueryFilter) ([]Aud
 		out = append(out, event)
 	}
 	return out, nil
+}
+
+// GetEntry implements AuditLog.GetEntry; see the interface's doc comment
+// for the full contract. Backed by a direct (chain_id, entry_id)
+// primary-key lookup — O(1), not a range scan.
+func (a *postgresAuditLog) GetEntry(ctx context.Context, chainID string, id EntryID) (AuditEvent, error) {
+	if a.closed.Load() {
+		return AuditEvent{}, ErrClosed
+	}
+	if chainID == "" {
+		return AuditEvent{}, ErrChainIDRequired
+	}
+
+	row, err := a.q.GetEntryByID(ctx, postgresdb.GetEntryByIDParams{ChainID: chainID, EntryID: toPgEntryID(id)})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return AuditEvent{}, ErrEntryNotFound
+	case err != nil:
+		return AuditEvent{}, fmt.Errorf("graudit: get entry: %w", ErrBackendUnavailable)
+	}
+
+	event, err := postgresEntryToAuditEvent(row)
+	if err != nil {
+		return AuditEvent{}, fmt.Errorf("graudit: get entry: %w", err)
+	}
+	return event, nil
+}
+
+// LatestEntryID implements AuditLog.LatestEntryID; see the interface's doc
+// comment for the full contract. Reuses GetLastEntry — the same query
+// Record already uses to resolve the chain tail — rather than a new one.
+func (a *postgresAuditLog) LatestEntryID(ctx context.Context, chainID string) (EntryID, error) {
+	if a.closed.Load() {
+		return 0, ErrClosed
+	}
+	if chainID == "" {
+		return 0, ErrChainIDRequired
+	}
+
+	latest, err := a.resolveLatestEntryID(ctx, chainID)
+	if err != nil {
+		return 0, fmt.Errorf("graudit: latest entry id: %w", err)
+	}
+	return latest, nil
 }
 
 // Close implements AuditLog.Close; idempotent via sync.Once. Only closes
