@@ -4,6 +4,10 @@
 SELECT chain_id, entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash
 FROM graudit_entries WHERE chain_id = @chain_id ORDER BY entry_id DESC LIMIT 1;
 
+-- name: GetEntryByID :one
+SELECT chain_id, entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash
+FROM graudit_entries WHERE chain_id = @chain_id AND entry_id = @entry_id;
+
 -- name: InsertEntry :exec
 INSERT INTO graudit_entries (chain_id, entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);

@@ -88,11 +88,19 @@ type AuditLog interface {
 	// reserved for genuine operational failures (e.g. can't reach the
 	// backend).
 	//
+	// to has a sentinel meaning "verify through the latest entry": a
+	// zero value (EntryID never assigns 0 to a real entry) resolves to
+	// chainID's current tail — the same position LatestEntryID returns —
+	// rather than matching zero rows. A chainID with no entries at all is
+	// reported via VerifyResult.Empty, not conflated with a real full-chain
+	// verify.
+	//
 	// Parameters:
 	//   - ctx: context.Context
 	//   - chainID: string — required; from/to are positions within this
 	//     chain only, never across chains
-	//   - from, to: EntryID — inclusive range within chainID; from must be >= 1
+	//   - from, to: EntryID — inclusive range within chainID; from must be
+	//     >= 1; to == 0 means "through the latest entry" (see above)
 	//
 	// Returns:
 	//   - ok: bool — true if every entry in range passes both checks
@@ -116,6 +124,41 @@ type AuditLog interface {
 	//     ErrClosed if called after Close, ErrBackendUnavailable for a
 	//     storage failure
 	Query(ctx context.Context, filter QueryFilter) ([]AuditEvent, error)
+
+	// GetEntry fetches a single entry by its position within chainID, via
+	// a direct indexed/keyed lookup on every backend (the postgres and
+	// mongo backends key their storage by (chainID, id) already) — O(1),
+	// never a Query-and-scan.
+	//
+	// Parameters:
+	//   - ctx: context.Context
+	//   - chainID: string — required
+	//   - id: EntryID — the entry's position within chainID
+	//
+	// Returns:
+	//   - AuditEvent: the matching entry
+	//   - error: wraps ErrChainIDRequired for an empty chainID,
+	//     ErrEntryNotFound if no entry with id exists in chainID, ErrClosed
+	//     if called after Close, ErrBackendUnavailable for a storage failure
+	GetEntry(ctx context.Context, chainID string, id EntryID) (AuditEvent, error)
+
+	// LatestEntryID returns the EntryID of the most recently recorded entry
+	// in chainID — the position Verify's to parameter resolves to when
+	// passed its zero-value sentinel (see Verify's own doc comment), and
+	// useful on its own for a caller that wants the tail without also
+	// running a full Verify.
+	//
+	// Parameters:
+	//   - ctx: context.Context
+	//   - chainID: string — required
+	//
+	// Returns:
+	//   - EntryID: the highest EntryID recorded in chainID
+	//   - error: wraps ErrChainIDRequired for an empty chainID,
+	//     ErrEntryNotFound if chainID has no entries recorded yet,
+	//     ErrClosed if called after Close, ErrBackendUnavailable for a
+	//     storage failure
+	LatestEntryID(ctx context.Context, chainID string) (EntryID, error)
 
 	// Close releases any underlying connections/resources. After Close,
 	// every other method returns ErrClosed. Close is idempotent.
@@ -213,8 +256,16 @@ type QueryFilter struct {
 // VerifyResult is the detailed outcome of Verify.
 type VerifyResult struct {
 	// Valid is true if every entry in the requested range passed both
-	// integrity checks.
+	// integrity checks. Also true (vacuously) when Empty is true — an
+	// empty chain has nothing to fail either check.
 	Valid bool
+
+	// Empty is true only when chainID has zero entries recorded at all
+	// (independent of the requested from/to), letting a caller that passed
+	// Verify's to==0 "latest" sentinel distinguish "there is nothing to
+	// verify yet" from a real full-chain pass. Always false unless to==0
+	// was requested and the chain turned out to be empty.
+	Empty bool
 
 	// BrokenAt is the lowest EntryID where a check failed; zero if Valid.
 	BrokenAt EntryID

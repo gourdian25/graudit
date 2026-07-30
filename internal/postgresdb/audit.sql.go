@@ -12,6 +12,34 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getEntryByID = `-- name: GetEntryByID :one
+SELECT chain_id, entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash
+FROM graudit_entries WHERE chain_id = $1 AND entry_id = $2
+`
+
+type GetEntryByIDParams struct {
+	ChainID string `db:"chain_id" json:"chain_id"`
+	EntryID int64  `db:"entry_id" json:"entry_id"`
+}
+
+func (q *Queries) GetEntryByID(ctx context.Context, arg GetEntryByIDParams) (GrauditEntry, error) {
+	row := q.db.QueryRow(ctx, getEntryByID, arg.ChainID, arg.EntryID)
+	var i GrauditEntry
+	err := row.Scan(
+		&i.ChainID,
+		&i.EntryID,
+		&i.ActorID,
+		&i.EntityType,
+		&i.EntityID,
+		&i.Action,
+		&i.Payload,
+		&i.Timestamp,
+		&i.Hash,
+		&i.PrevHash,
+	)
+	return i, err
+}
+
 const getLastEntry = `-- name: GetLastEntry :one
 
 SELECT chain_id, entry_id, actor_id, entity_type, entity_id, action, payload, timestamp, hash, prev_hash

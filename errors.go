@@ -31,7 +31,10 @@ var (
 	// landing in, or a query silently returning, another tenant's chain.
 	ErrChainIDRequired = errors.New("graudit: ChainID is required")
 
-	// ErrEntryNotFound indicates a query for a specific entry found none.
+	// ErrEntryNotFound indicates a query for a specific entry found none:
+	// GetEntry for an EntryID that doesn't exist in chainID, or
+	// LatestEntryID (and Verify's to==0 "latest" resolution) for a chainID
+	// with no entries recorded yet.
 	ErrEntryNotFound = errors.New("graudit: entry not found")
 
 	// ErrChainCorrupted indicates a backend-level invariant violation it

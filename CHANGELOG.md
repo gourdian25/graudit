@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-30
+
+Adds direct entry lookup and a reliable "verify the whole chain" call
+shape, closing two gaps a consumer needing per-entry lookup and
+whole-chain verification ran into: fetching one entry required an
+unbounded `Query` plus a linear scan, and `Verify`'s `to` parameter had no
+sentinel for "the end" — its Go zero value matched zero rows and returned
+`Valid: true` vacuously, indistinguishable from a real full-chain pass.
+Contains a **breaking change** (allowed pre-1.0) to `Verify`'s `to==0`
+behavior; see Changed below.
+
+### Added
+
+- **`AuditLog.GetEntry(ctx, chainID string, id EntryID) (AuditEvent,
+  error)`** — fetches a single entry by its position within `chainID` via a
+  direct indexed/keyed lookup on every backend (postgres: the
+  `(chain_id, entry_id)` primary key; mongo: the existing compound unique
+  index; memory: a linear scan, matching `Query`'s own documented
+  rationale for this test/dev-only backend) — O(1) on the two
+  production-eligible backends, never a `Query`-and-scan. Returns
+  `ErrEntryNotFound` for an `id` that doesn't exist in `chainID`.
+- **`AuditLog.LatestEntryID(ctx, chainID string) (EntryID, error)`** —
+  resolves `chainID`'s current tail `EntryID`, reusing each backend's
+  existing tail-tracking lookup (memory's `memoryChainTail`, postgres's
+  `GetLastEntry` query, mongo's chain-state singleton document) rather than
+  a new one. Returns `ErrEntryNotFound` for a `chainID` with no entries
+  recorded yet.
+- **`VerifyResult.Empty bool`** — true only when `chainID` has zero entries
+  recorded at all (independent of the requested range), letting a caller
+  that passed `Verify`'s `to==0` sentinel distinguish "nothing to verify
+  yet" from a real full-chain pass (both otherwise report `ok=true`).
+
+### Changed
+
+- **Breaking:** `Verify`'s `to` parameter gains a sentinel meaning "through
+  the current latest entry": `to == 0` (never a real `EntryID`, which
+  starts at 1) now resolves to `chainID`'s tail — the same position
+  `LatestEntryID` returns — instead of matching zero rows. Existing code
+  that called `Verify(ctx, chainID, from, 0)` expecting the old vacuous
+  `Valid: true` result over an empty range will now actually verify the
+  whole chain; an explicit non-zero `to` is unaffected and still selects a
+  specific sub-range exactly as before.
+- `ErrEntryNotFound` (defined since `v0.1.0` but never actually returned by
+  any method until now) is returned for the first time: by `GetEntry` for a
+  nonexistent `id`, and by `LatestEntryID`/`Verify`'s `to==0` resolution for
+  a `chainID` with no entries recorded yet.
+
 ## [0.4.0] - 2026-07-28
 
 Multi-chain support: one `AuditLog` instance (one connection pool) can now
