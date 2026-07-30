@@ -176,7 +176,7 @@ matching grcache's and gourdiantoken's own test connection strings exactly.
   live service isn't reachable). This was originally a separate,
   publicly-importable `conformance` package — folded into the root
   package's own tests for ecosystem consistency; see
-  `docs/architecture.md`'s closing section. 14 scenarios per backend,
+  `docs/architecture.md`'s closing section. 17 scenarios per backend,
   including the most important tests in the repo:
   `ConcurrentRecordStress`/`ConcurrentRecordStressMultiChain` (prove the
   serialization strategy actually works under real concurrent `Record()`

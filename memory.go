@@ -142,6 +142,16 @@ func (a *memoryAuditLog) RecordChange(ctx context.Context, chainID, actorID, ent
 	return a.Record(ctx, event)
 }
 
+// latestEntryIDLocked returns chainID's current tail EntryID and whether it
+// has any entries at all. Caller must already hold a.mu.
+func (a *memoryAuditLog) latestEntryIDLocked(chainID string) (EntryID, bool) {
+	tail := a.chains[chainID]
+	if tail == nil {
+		return 0, false
+	}
+	return tail.lastID, true
+}
+
 // Verify implements AuditLog.Verify; see the interface's doc comment for
 // the full contract and verifyChain's doc comment for the two-check
 // design.
@@ -157,6 +167,14 @@ func (a *memoryAuditLog) Verify(ctx context.Context, chainID string, from, to En
 	}
 
 	a.mu.Lock()
+	if to == 0 {
+		latest, ok := a.latestEntryIDLocked(chainID)
+		if !ok {
+			a.mu.Unlock()
+			return true, VerifyResult{Valid: true, Empty: true}, nil
+		}
+		to = latest
+	}
 	entries := make([]AuditEvent, 0, len(a.entries))
 	for _, e := range a.entries {
 		if e.ChainID == chainID && e.ID >= from && e.ID <= to {
@@ -244,6 +262,50 @@ func (a *memoryAuditLog) Query(ctx context.Context, filter QueryFilter) ([]Audit
 		}
 	}
 	return out, nil
+}
+
+// GetEntry implements AuditLog.GetEntry; see the interface's doc comment
+// for the full contract. This is a linear scan over the in-memory slice —
+// acceptable specifically because this is the test/dev-only backend, never
+// the production one (matching Query's own linear scan).
+func (a *memoryAuditLog) GetEntry(ctx context.Context, chainID string, id EntryID) (AuditEvent, error) {
+	if a.closed.Load() {
+		return AuditEvent{}, ErrClosed
+	}
+	if chainID == "" {
+		return AuditEvent{}, ErrChainIDRequired
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for _, e := range a.entries {
+		if e.ChainID == chainID && e.ID == id {
+			return e, nil
+		}
+	}
+	return AuditEvent{}, ErrEntryNotFound
+}
+
+// LatestEntryID implements AuditLog.LatestEntryID; see the interface's doc
+// comment for the full contract. O(1): memoryChainTail already tracks each
+// chain's current tail.
+func (a *memoryAuditLog) LatestEntryID(ctx context.Context, chainID string) (EntryID, error) {
+	if a.closed.Load() {
+		return 0, ErrClosed
+	}
+	if chainID == "" {
+		return 0, ErrChainIDRequired
+	}
+
+	a.mu.Lock()
+	latest, ok := a.latestEntryIDLocked(chainID)
+	a.mu.Unlock()
+
+	if !ok {
+		return 0, ErrEntryNotFound
+	}
+	return latest, nil
 }
 
 // Close implements AuditLog.Close; idempotent via sync.Once.

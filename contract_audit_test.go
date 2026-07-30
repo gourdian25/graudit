@@ -125,6 +125,9 @@ func runAuditContract(t *testing.T, newLog newLogFunc, newLogWithBus newLogWithB
 	t.Run("QueryFilters", func(t *testing.T) { testQueryFilters(t, newLog) })
 	t.Run("ChainIsolation", func(t *testing.T) { testChainIsolation(t, newLog) })
 	t.Run("ChainIsolationTamperContainment", func(t *testing.T) { testChainIsolationTamperContainment(t, newLog, cfg.tamperHook) })
+	t.Run("GetEntry", func(t *testing.T) { testGetEntry(t, newLog) })
+	t.Run("GetEntryChainIsolation", func(t *testing.T) { testGetEntryChainIsolation(t, newLog) })
+	t.Run("LatestEntryID", func(t *testing.T) { testLatestEntryID(t, newLog) })
 	t.Run("PublishOnRecord", func(t *testing.T) { testPublishOnRecord(t, newLogWithBus) })
 	t.Run("PublishFailureDoesNotFailRecord", func(t *testing.T) { testPublishFailureDoesNotFailRecord(t, newLogWithBus) })
 	t.Run("PostClose", func(t *testing.T) { testPostClose(t, newLog) })
@@ -696,6 +699,155 @@ func testChainIsolationTamperContainment(t *testing.T, newLog newLogFunc, tamper
 	}
 }
 
+// testGetEntry records N entries into testChainID and confirms GetEntry
+// fetches each one back by its EntryID with every field intact, plus
+// ErrEntryNotFound for an EntryID that was never recorded.
+func testGetEntry(t *testing.T, newLog newLogFunc) {
+	t.Helper()
+	ctx := context.Background()
+	log, err := newLog()
+	if err != nil {
+		t.Fatalf("newLog: %v", err)
+	}
+	defer log.Close()
+
+	const n = 4
+	recorded := make([]AuditEvent, 0, n)
+	for i := 0; i < n; i++ {
+		event := AuditEvent{ChainID: testChainID, ActorID: "actor:1", EntityType: "widget", EntityID: fmt.Sprintf("w%d", i), Action: "create"}
+		id, err := log.Record(ctx, event)
+		if err != nil {
+			t.Fatalf("Record #%d: %v", i, err)
+		}
+		event.ID = id
+		recorded = append(recorded, event)
+	}
+
+	entries, err := log.Query(ctx, QueryFilter{ChainID: testChainID})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(entries) != n {
+		t.Fatalf("Query returned %d entries, want %d", len(entries), n)
+	}
+
+	for i, want := range recorded {
+		got, err := log.GetEntry(ctx, testChainID, want.ID)
+		if err != nil {
+			t.Fatalf("GetEntry #%d (id=%d): %v", i, want.ID, err)
+		}
+		full := entries[i] // the durably-stored version, with Hash/PrevHash/Timestamp populated
+		if got.ChainID != full.ChainID || got.ID != full.ID || got.ActorID != full.ActorID ||
+			got.EntityType != full.EntityType || got.EntityID != full.EntityID || got.Action != full.Action ||
+			got.Hash != full.Hash || got.PrevHash != full.PrevHash {
+			t.Fatalf("GetEntry #%d = %+v, want %+v", i, got, full)
+		}
+	}
+
+	if _, err := log.GetEntry(ctx, testChainID, EntryID(n+1)); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("GetEntry for a never-recorded id: err=%v, want ErrEntryNotFound", err)
+	}
+}
+
+// testGetEntryChainIsolation records entry #1 into two independent chains
+// with distinguishable EntityID values and confirms GetEntry(chainID, 1)
+// returns the right chain's own entry — proves a direct-by-ID lookup never
+// leaks across chains despite both chains' EntryID sequences colliding
+// numerically (both start at 1).
+func testGetEntryChainIsolation(t *testing.T, newLog newLogFunc) {
+	t.Helper()
+	ctx := context.Background()
+	log, err := newLog()
+	if err != nil {
+		t.Fatalf("newLog: %v", err)
+	}
+	defer log.Close()
+
+	idA, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "actor:1", EntityType: "widget", EntityID: "chainA-w1", Action: "create"})
+	if err != nil {
+		t.Fatalf("Record chain A: %v", err)
+	}
+	idB, err := log.Record(ctx, AuditEvent{ChainID: testChainID2, ActorID: "actor:1", EntityType: "widget", EntityID: "chainB-w1", Action: "create"})
+	if err != nil {
+		t.Fatalf("Record chain B: %v", err)
+	}
+	if idA != 1 || idB != 1 {
+		t.Fatalf("expected both chains' first entry to be EntryID 1 independently, got chain A=%d chain B=%d", idA, idB)
+	}
+
+	entryA, err := log.GetEntry(ctx, testChainID, 1)
+	if err != nil {
+		t.Fatalf("GetEntry(chain A, 1): %v", err)
+	}
+	if entryA.EntityID != "chainA-w1" {
+		t.Fatalf("GetEntry(chain A, 1).EntityID = %q, want %q (cross-chain leak)", entryA.EntityID, "chainA-w1")
+	}
+
+	entryB, err := log.GetEntry(ctx, testChainID2, 1)
+	if err != nil {
+		t.Fatalf("GetEntry(chain B, 1): %v", err)
+	}
+	if entryB.EntityID != "chainB-w1" {
+		t.Fatalf("GetEntry(chain B, 1).EntityID = %q, want %q (cross-chain leak)", entryB.EntityID, "chainB-w1")
+	}
+}
+
+// testLatestEntryID confirms LatestEntryID and Verify's to==0 "latest"
+// sentinel agree: ErrEntryNotFound/VerifyResult.Empty on a never-recorded
+// chain, and the actual tail EntryID once entries exist, matching an
+// explicit Verify(chainID, 1, n) call.
+func testLatestEntryID(t *testing.T, newLog newLogFunc) {
+	t.Helper()
+	ctx := context.Background()
+	log, err := newLog()
+	if err != nil {
+		t.Fatalf("newLog: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.LatestEntryID(ctx, testChainID); !errors.Is(err, ErrEntryNotFound) {
+		t.Fatalf("LatestEntryID on a never-recorded chain: err=%v, want ErrEntryNotFound", err)
+	}
+	okEmpty, detailEmpty, err := log.Verify(ctx, testChainID, 1, 0)
+	if err != nil {
+		t.Fatalf("Verify(chainID, 1, 0) on a never-recorded chain: %v", err)
+	}
+	if !okEmpty || !detailEmpty.Empty {
+		t.Fatalf("Verify(chainID, 1, 0) on a never-recorded chain = ok=%v detail=%+v, want ok=true detail.Empty=true", okEmpty, detailEmpty)
+	}
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "actor:1", EntityType: "widget", EntityID: fmt.Sprintf("w%d", i), Action: "create"}); err != nil {
+			t.Fatalf("Record #%d: %v", i, err)
+		}
+	}
+
+	latest, err := log.LatestEntryID(ctx, testChainID)
+	if err != nil {
+		t.Fatalf("LatestEntryID: %v", err)
+	}
+	if latest != n {
+		t.Fatalf("LatestEntryID = %d, want %d", latest, n)
+	}
+
+	okLatest, detailLatest, err := log.Verify(ctx, testChainID, 1, 0)
+	if err != nil {
+		t.Fatalf("Verify(chainID, 1, 0): %v", err)
+	}
+	okExplicit, detailExplicit, err := log.Verify(ctx, testChainID, 1, EntryID(n))
+	if err != nil {
+		t.Fatalf("Verify(chainID, 1, n): %v", err)
+	}
+	if okLatest != okExplicit || detailLatest != detailExplicit {
+		t.Fatalf("Verify(chainID, 1, 0) = ok=%v detail=%+v, want it to match Verify(chainID, 1, %d) = ok=%v detail=%+v",
+			okLatest, detailLatest, n, okExplicit, detailExplicit)
+	}
+	if !okLatest || detailLatest.Empty {
+		t.Fatalf("Verify(chainID, 1, 0) after %d records = ok=%v detail=%+v, want ok=true detail.Empty=false", n, okLatest, detailLatest)
+	}
+}
+
 func testPublishOnRecord(t *testing.T, newLogWithBus newLogWithBusFunc) {
 	t.Helper()
 	ctx := context.Background()
@@ -782,5 +934,11 @@ func testPostClose(t *testing.T, newLog newLogFunc) {
 	}
 	if _, err := log.Query(ctx, QueryFilter{ChainID: testChainID}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Query after Close error = %v, want ErrClosed", err)
+	}
+	if _, err := log.GetEntry(ctx, testChainID, 1); !errors.Is(err, ErrClosed) {
+		t.Fatalf("GetEntry after Close error = %v, want ErrClosed", err)
+	}
+	if _, err := log.LatestEntryID(ctx, testChainID); !errors.Is(err, ErrClosed) {
+		t.Fatalf("LatestEntryID after Close error = %v, want ErrClosed", err)
 	}
 }

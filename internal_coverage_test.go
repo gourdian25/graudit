@@ -86,6 +86,30 @@ func TestMemoryAuditLog_Query_EmptyChainID(t *testing.T) {
 	}
 }
 
+func TestMemoryAuditLog_GetEntry_EmptyChainID(t *testing.T) {
+	log, err := NewMemoryAuditLog()
+	if err != nil {
+		t.Fatalf("NewMemoryAuditLog: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.GetEntry(context.Background(), "", 1); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("GetEntry with an empty chainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
+func TestMemoryAuditLog_LatestEntryID_EmptyChainID(t *testing.T) {
+	log, err := NewMemoryAuditLog()
+	if err != nil {
+		t.Fatalf("NewMemoryAuditLog: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.LatestEntryID(context.Background(), ""); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("LatestEntryID with an empty chainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
 func TestPostgresAuditLog_Verify_EmptyChainID(t *testing.T) {
 	log, err := newPostgresLog()
 	if err != nil {
@@ -110,6 +134,30 @@ func TestPostgresAuditLog_Query_EmptyChainID(t *testing.T) {
 	}
 }
 
+func TestPostgresAuditLog_GetEntry_EmptyChainID(t *testing.T) {
+	log, err := newPostgresLog()
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.GetEntry(context.Background(), "", 1); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("GetEntry with an empty chainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
+func TestPostgresAuditLog_LatestEntryID_EmptyChainID(t *testing.T) {
+	log, err := newPostgresLog()
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.LatestEntryID(context.Background(), ""); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("LatestEntryID with an empty chainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
 func TestMongoAuditLog_Verify_EmptyChainID(t *testing.T) {
 	log, err := newMongoLog()
 	if err != nil {
@@ -131,6 +179,30 @@ func TestMongoAuditLog_Query_EmptyChainID(t *testing.T) {
 
 	if _, err := log.Query(context.Background(), QueryFilter{}); !errors.Is(err, ErrChainIDRequired) {
 		t.Fatalf("Query with an empty ChainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
+func TestMongoAuditLog_GetEntry_EmptyChainID(t *testing.T) {
+	log, err := newMongoLog()
+	if err != nil {
+		t.Skipf("MongoDB not available, skipping: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.GetEntry(context.Background(), "", 1); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("GetEntry with an empty chainID: err=%v, want ErrChainIDRequired", err)
+	}
+}
+
+func TestMongoAuditLog_LatestEntryID_EmptyChainID(t *testing.T) {
+	log, err := newMongoLog()
+	if err != nil {
+		t.Skipf("MongoDB not available, skipping: %v", err)
+	}
+	defer log.Close()
+
+	if _, err := log.LatestEntryID(context.Background(), ""); !errors.Is(err, ErrChainIDRequired) {
+		t.Fatalf("LatestEntryID with an empty chainID: err=%v, want ErrChainIDRequired", err)
 	}
 }
 
@@ -401,8 +473,20 @@ func TestPostgresAuditLog_OperationsAfterPoolClosed(t *testing.T) {
 	if _, _, err := log.Verify(ctx, testChainID, 1, 1); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Verify after pool closed: err=%v, want ErrBackendUnavailable", err)
 	}
+	// to=0 exercises resolveLatestEntryID's own ErrBackendUnavailable
+	// branch inside Verify, distinct from the to=1 call above which never
+	// reaches that code path.
+	if _, _, err := log.Verify(ctx, testChainID, 1, 0); !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("Verify(to=0) after pool closed: err=%v, want ErrBackendUnavailable", err)
+	}
 	if _, err := log.Query(ctx, QueryFilter{ChainID: testChainID}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Query after pool closed: err=%v, want ErrBackendUnavailable", err)
+	}
+	if _, err := log.GetEntry(ctx, testChainID, 1); !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("GetEntry after pool closed: err=%v, want ErrBackendUnavailable", err)
+	}
+	if _, err := log.LatestEntryID(ctx, testChainID); !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("LatestEntryID after pool closed: err=%v, want ErrBackendUnavailable", err)
 	}
 	// Close itself is still safe to call (idempotent via sync.Once) even
 	// though the pool was already closed out from under it directly.
@@ -435,8 +519,51 @@ func TestMongoAuditLog_OperationsAfterClientDisconnected(t *testing.T) {
 	if _, _, err := log.Verify(ctx, testChainID, 1, 1); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Verify after client disconnected: err=%v, want ErrBackendUnavailable", err)
 	}
+	// to=0 exercises resolveLatestEntryID's own ErrBackendUnavailable
+	// branch inside Verify, distinct from the to=1 call above which never
+	// reaches that code path.
+	if _, _, err := log.Verify(ctx, testChainID, 1, 0); !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("Verify(to=0) after client disconnected: err=%v, want ErrBackendUnavailable", err)
+	}
 	if _, err := log.Query(ctx, QueryFilter{ChainID: testChainID}); !errors.Is(err, ErrBackendUnavailable) {
 		t.Fatalf("Query after client disconnected: err=%v, want ErrBackendUnavailable", err)
+	}
+	if _, err := log.GetEntry(ctx, testChainID, 1); !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("GetEntry after client disconnected: err=%v, want ErrBackendUnavailable", err)
+	}
+	if _, err := log.LatestEntryID(ctx, testChainID); !errors.Is(err, ErrBackendUnavailable) {
+		t.Fatalf("LatestEntryID after client disconnected: err=%v, want ErrBackendUnavailable", err)
+	}
+}
+
+// TestMongoAuditLog_GetEntry_InvalidStoredPayload mirrors
+// TestMongoAuditLog_Query_InvalidStoredPayload: GetEntry has its own
+// decode-error wrapping line distinct from Query's, so it needs its own
+// direct coverage rather than relying on that test alone.
+func TestMongoAuditLog_GetEntry_InvalidStoredPayload(t *testing.T) {
+	log, err := newMongoLog()
+	if err != nil {
+		t.Skipf("MongoDB not available, skipping: %v", err)
+	}
+	defer log.Close()
+
+	ctx := context.Background()
+	if _, err := log.Record(ctx, AuditEvent{ChainID: testChainID, ActorID: "a", EntityType: "t", EntityID: "1", Action: "create"}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(mongoTestURI))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer client.Disconnect(ctx)
+	coll := client.Database(mongoTestDatabase).Collection("graudit_entries")
+	if _, err := coll.UpdateOne(ctx, bson.M{"chainId": testChainID, "entryId": uint64(1)}, bson.M{"$set": bson.M{"payload": []byte(`not-valid-json`)}}); err != nil {
+		t.Fatalf("corrupt payload: %v", err)
+	}
+
+	if _, err := log.GetEntry(ctx, testChainID, 1); err == nil {
+		t.Fatal("expected GetEntry to surface a decode error for a corrupted payload, got nil")
 	}
 }
 

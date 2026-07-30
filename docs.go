@@ -25,7 +25,14 @@
 // # Key Features
 //
 //   - A single AuditLog interface: Record, RecordChange, Verify, Query,
-//     Close — implemented identically by all three backends
+//     GetEntry, LatestEntryID, Close — implemented identically by all
+//     three backends
+//   - GetEntry(chainID, id) fetches one entry by its position via a
+//     direct indexed/keyed lookup — O(1) on every backend, never a
+//     Query-and-scan
+//   - LatestEntryID(chainID) resolves a chain's current tail EntryID —
+//     also the position Verify's to parameter resolves to via its
+//     zero-value sentinel (see below)
 //   - Multi-chain: every call is scoped by a required ChainID, so one
 //     AuditLog instance (one connection pool) can serve any number of
 //     independent hash chains — e.g. one per tenant in a multi-tenant
@@ -93,7 +100,7 @@
 //
 //	log_.Record(ctx, graudit.AuditEvent{ChainID: "tenant:acme", ...})
 //	log_.Record(ctx, graudit.AuditEvent{ChainID: "platform:ops", ...})
-//	ok, detail, err := log_.Verify(ctx, "tenant:acme", 1, latestID)
+//	ok, detail, err := log_.Verify(ctx, "tenant:acme", 1, 0) // to=0: verify through the latest entry
 //
 // # Backends
 //
@@ -170,14 +177,23 @@
 //
 // # Verify() Semantics
 //
-//	ok, detail, err := log_.Verify(ctx, chainID, 1, latestID)
+//	ok, detail, err := log_.Verify(ctx, chainID, 1, 0) // to=0: through the latest entry
 //	if err != nil {
 //		// operational failure — could not even attempt verification
 //	}
-//	if !ok {
+//	if detail.Empty {
+//		// chainID has no entries recorded yet — not a tampering signal
+//	} else if !ok {
 //		log.Printf("tampering detected at entry %d: expected %s, got %s",
 //			detail.BrokenAt, detail.Expected, detail.Actual)
 //	}
+//
+// to's zero value is a sentinel meaning "verify through chainID's current
+// latest entry" (the same position LatestEntryID returns) rather than
+// matching zero rows — a caller wanting a specific historical sub-range
+// still passes an explicit non-zero to. VerifyResult.Empty is set only
+// when chainID genuinely has no entries at all, distinguishing that case
+// from a real full-chain pass (both otherwise report ok=true).
 //
 // # Testing
 //

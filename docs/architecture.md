@@ -217,6 +217,61 @@ two independent checks per entry:
 this correctly identifies the first tampered/broken entry regardless of
 how many entries follow it in the requested range.
 
+## `GetEntry`/`LatestEntryID`, and `Verify`'s `to==0` sentinel
+
+Before these were added, fetching one entry by `EntryID` required an
+unbounded `Query` plus a linear scan of the result, and "verify the whole
+chain" had no dedicated call shape: `Verify`'s `to` parameter has no
+sentinel for "the end," so passing its Go zero value matched zero rows
+(`EntryID`s start at 1) and returned `VerifyResult.Valid: true` vacuously —
+indistinguishable from a real full-chain pass to any caller checking only
+`ok`.
+
+`GetEntry(ctx, chainID, id)` and `LatestEntryID(ctx, chainID)` close both
+gaps additively, backed entirely by lookups each backend already performs
+elsewhere — no new storage structures:
+
+- **memory**: `memoryChainTail` (`a.chains[chainID]`) already tracks each
+  chain's `lastID`/`lastHash` for `Record`'s own tail resolution; both new
+  methods (and `Verify`'s `to==0` case) reuse it directly via a small
+  `latestEntryIDLocked` helper. `GetEntry` itself stays a linear scan over
+  `a.entries` — matching `Query`'s own documented rationale, since this
+  backend is test/dev-only and never production.
+- **postgres**: `GetEntry` is a new `GetEntryByID` sqlc query, a direct
+  `(chain_id, entry_id)` primary-key lookup — genuinely O(1), not a range
+  scan. `LatestEntryID`/`Verify`'s `to==0` reuse the existing
+  `GetLastEntry` query (the same one `Record` already calls to resolve the
+  tail before inserting) via a `resolveLatestEntryID` helper.
+- **mongo**: `GetEntry` is a direct `FindOne` on `{chainId, entryId}` —
+  already the entries collection's compound unique index (see "Multi-chain
+  support" above), so also O(1)/indexed with no new index needed.
+  `LatestEntryID`/`Verify`'s `to==0` reuse the chain-state singleton
+  document (`mongoChainState`, the same one `Record` reads to resolve the
+  tail) via the same `resolveLatestEntryID` helper pattern as postgres.
+
+`to == 0` is a safe, unambiguous sentinel precisely because `EntryID` never
+assigns 0 to a real entry (already true and relied on elsewhere — see
+`Verify`'s existing `from < 1` clamp). No new `ErrX` sentinel was
+introduced for "not found" either: `GetEntry`'s no-such-id case and
+`LatestEntryID`'s empty-chain case both reuse the existing
+`ErrEntryNotFound`, whose doc comment was widened to name both callers
+explicitly.
+
+`VerifyResult.Empty` is deliberately narrow: it is set only when `chainID`
+has zero entries recorded *at all*, regardless of the requested range —
+not whenever a range happens to match zero rows. An explicit non-zero `to`
+that lands before an existing chain's `from` (a caller mistake, not an
+empty-chain question) is unaffected and keeps the pre-existing vacuous
+`Valid: true, Empty: false` result.
+
+This is a breaking change for exactly one existing call shape:
+`Verify(ctx, chainID, from, 0)` used to vacuously verify zero rows and now
+resolves `to` to the chain's actual tail — consistent with this repo's
+established pre-1.0 precedent of accepting breaking changes (see the
+`[0.3.0]`/`[0.4.0]` CHANGELOG entries) rather than carrying a footgun
+forward for the sake of a technically-unbroken zero-value default nobody
+was relying on for "verify everything."
+
 ## Payload storage and hash determinism across backends
 
 `AuditEvent.Payload` is stored as JSON bytes (Postgres `jsonb`, a raw BSON
