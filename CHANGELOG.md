@@ -5,6 +5,85 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-14
+
+**Breaking, for the Postgres backend only.** Closes a gap found while
+wiring `NewPostgresAuditLog` into a real consumer using a deliberately
+least-privilege runtime role: schema auto-apply on every connect required
+`CREATE` on the target schema, which that role doesn't have, so
+construction failed every time with `permission denied for schema ...` —
+and this can't be worked around by pre-creating the tables some other way,
+since `CREATE TABLE IF NOT EXISTS` still checks `CREATE` privilege before
+checking whether the table exists, so the attempt fails regardless of who
+creates the table or how.
+
+Rather than add a flag to opt out of auto-apply on a per-call basis,
+`NewPostgresAuditLog` now **never** applies schema at all — see
+[docs/architecture.md](docs/architecture.md)'s "`NewPostgresAuditLog`
+never applies its own schema" section for the full pattern and rationale
+(graudit doesn't use gourdiantoken's dedicated-`docs/postgres.md`-per-backend
+convention; every backend divergence, this one included, is documented in
+`docs/architecture.md` instead).
+
+No module path change: Go doesn't require a version-suffixed import path
+until a `v2` major release, and graudit is still pre-1.0 — this ships as a
+`0.x.y` breaking change under the same "allowed pre-1.0" precedent as the
+`[0.3.0]`/`[0.4.0]` entries below, not a compatibility break requiring a
+new import path the way gourdiantoken's own `v2.x` breaking releases have
+had to reason about.
+
+### Changed
+
+- **`NewPostgresAuditLog(cfg)` no longer applies schema.** Signature is
+  unchanged, but its behavior is: construction now only pings the pool (the
+  caller-supplied `PostgresConfig.Pool`) or dials-then-pings one (from
+  `PostgresConfig.DSN`). Apply the schema yourself, once, before
+  constructing — see Migration below. Calling this against a database
+  where `graudit_entries` doesn't exist yet no longer fails construction
+  itself; it fails on the first actual `AuditLog` method call (`Record`,
+  `Query`, ...) with a plain Postgres "relation does not exist" error
+  instead. The schema itself is unchanged (still `CREATE TABLE/INDEX IF
+  NOT EXISTS`, still the same `graudit_entries` table and its four
+  indexes).
+
+### Added
+
+- **`PostgresSchemaSQL() string`**, returning graudit's Postgres schema
+  (`internal/postgresdb/schema.sql`, unchanged) as text, for applying
+  through your own project's migration tool (golang-migrate, Flyway, a
+  plain SQL file run in CI, whatever you already use) — see
+  docs/architecture.md.
+
+### Migration (only if your Postgres role doesn't already have `CREATE`)
+
+If your Postgres role already has `CREATE` on the target schema (the
+common case for a dev database or a single-role deployment), nothing
+about your setup actually breaks except the timing: apply
+`PostgresSchemaSQL()` once, via any method (even a one-off `psql -f`
+piping its output), before your application first connects, and
+everything else works exactly as before.
+
+If your application connects with a least-privilege, migrations-excluded
+role (the setup this release exists for), add a step to your own
+migration tooling that applies `graudit.PostgresSchemaSQL()`'s text
+against the target database, run once by whatever role already owns your
+other migrations, before deploying a graudit-using binary against it.
+
+### Testing
+
+- `postgres_test.go`'s `truncatePostgresTestDB` (graudit's own Postgres
+  test setup, not a real consumer) now explicitly calls the unexported
+  `applyPostgresSchema` immediately after its `DROP TABLE IF EXISTS`,
+  since `NewPostgresAuditLog` no longer does this implicitly. Order matters:
+  applying schema *before* the drop would just recreate the table and then
+  immediately discard it again, leaving nothing for the constructor to see.
+  `internal_coverage_test.go`'s `TestPostgresAuditLog_ConfigTuning` (the one
+  test that constructed `NewPostgresAuditLog` directly rather than through
+  the shared `newPostgresLog` helper, then called `Record`) gained the same
+  schema-ensuring pre-check `TestNewPostgresAuditLog_FullConfig` already
+  used, since it could no longer rely on construction implicitly creating
+  the table.
+
 ## [0.5.0] - 2026-07-30
 
 Adds direct entry lookup and a reliable "verify the whole chain" call

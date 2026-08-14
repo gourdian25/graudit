@@ -132,7 +132,10 @@
 //     docs/architecture.md). PostgresConfig accepts either DSN (dials its
 //     own pool) or an already-open Pool (shares one your application
 //     already owns, e.g. across hundreds of tenant chains) — exactly one
-//     of the two is required.
+//     of the two is required. Construction never applies schema itself —
+//     apply PostgresSchemaSQL() through your own migration tool first, see
+//     docs/architecture.md's "NewPostgresAuditLog never applies its own
+//     schema" section.
 //
 //     log_, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{DSN: dsn})
 //     log_, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{Pool: sharedPool})
