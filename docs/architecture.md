@@ -30,12 +30,54 @@ The postgres backend's GORM implementation was replaced with `pgx/v5` and
 sqlc-generated queries (see `internal/postgresdb`), matching
 gourdiantoken's and grnoti's own Postgres backend pattern. This introduced
 a *second* Postgres advisory lock, `grauditSchemaLockKey`
-(`5_198_204_733`), used only to serialize schema application (`CREATE
-TABLE/INDEX IF NOT EXISTS`) across concurrent callers at connect time —
-deliberately distinct from `chainLockKey` (`892374651`), which continues
-to serialize the actual chain-append transaction as it always has. The two
-locks protect different things at different times and are never held
+(`5_198_204_733`), used to serialize schema application (`CREATE
+TABLE/INDEX IF NOT EXISTS`) across concurrent callers — deliberately
+distinct from `chainLockKey` (`892374651`), which continues to serialize
+the actual chain-append transaction as it always has. The two locks
+protect different things at different times and are never held
 simultaneously, so there's no reason to unify them into one key.
+
+### `NewPostgresAuditLog` never applies its own schema
+
+Originally (through `v0.5.0`), `NewPostgresAuditLog`/`connectPostgres`
+applied the embedded schema unconditionally on every connect, guarded by
+`grauditSchemaLockKey` so concurrent callers racing to construct an
+`AuditLog` against the same fresh database didn't race on the DDL. That
+was removed (see `CHANGELOG.md`'s `[0.6.0]` entry): doing so requires the
+runtime connection's role to have `CREATE` on the target schema, which a
+deliberately least-privilege application role (a common production
+setup — a separate role owns migrations, the app connects with a
+DML-only role) won't have, and there's no workaround that pre-creates the
+tables some other way either, since `CREATE TABLE IF NOT EXISTS` still
+checks `CREATE` privilege before checking whether the table exists — it
+fails with `permission denied for schema ...` every time regardless.
+Matches the same fix gourdiantoken and grnoti already shipped for their
+own Postgres backends.
+
+`NewPostgresAuditLog` now only pings the pool; the `graudit_entries` table
+(and its indexes) must already exist before it's called. The exported
+`PostgresSchemaSQL() string` function returns the same embedded schema
+text as before (`internal/postgresdb/schema.sql`, unchanged) for the
+caller to apply through their own project's migration tool (golang-migrate,
+Flyway, a plain SQL file run in CI, ...) once, ahead of ever constructing
+an `AuditLog` — graudit does not ship a migration tool of its own, and
+does not attempt to detect or apply schema drift beyond that one initial
+apply. Calling `NewPostgresAuditLog` against a database where the table
+doesn't exist yet does not fail construction itself — it fails on the
+first actual `AuditLog` method call (`Record`, `Query`, ...) with a plain
+Postgres "relation does not exist" error, the same deferred-failure shape
+as any other missing-table bug.
+
+`applyPostgresSchema` (and `grauditSchemaLockKey`) stay in `postgres.go`,
+unexported, used only by graudit's own test setup now (`postgres_test.go`'s
+`truncatePostgresTestDB`) against a test database this repo's own test
+process fully controls — not by any code path a real consumer's binary
+ever executes. gourdiantoken documents this same pattern in its own
+`docs/postgres.md`; graudit doesn't use a dedicated-file-per-backend docs
+convention (this one `docs/architecture.md` covers every backend's
+divergences), so the full pattern and rationale lives in this section
+instead, cross-referenced from `postgres.go`'s package doc comment and
+`PostgresSchemaSQL`'s own doc comment.
 
 ## Multi-chain support: `ChainID` must be part of the hash preimage
 

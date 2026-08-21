@@ -714,14 +714,28 @@ func TestMongoAuditLog_Verify_ClampsFromBelowOne(t *testing.T) {
 // TestNewPostgresAuditLog_FullConfig already provides, with a short enough
 // MaxConnLifetime that a real Record still succeeds against a pool that
 // may recycle its one connection mid-test.
+//
+// The Record call below needs graudit_entries to already exist, which the
+// tuned NewPostgresAuditLog call under test no longer guarantees itself
+// (see postgres.go's PostgresSchemaSQL doc comment) — so, matching
+// TestNewPostgresAuditLog_FullConfig's own established pattern, a throwaway
+// newPostgresLog() call goes first purely to skip cleanly when Postgres
+// isn't available and to ensure the schema exists via its own
+// applyPostgresSchema call.
 func TestPostgresAuditLog_ConfigTuning(t *testing.T) {
+	if warm, err := newPostgresLog(); err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	} else {
+		_ = warm.Close()
+	}
+
 	log, err := NewPostgresAuditLog(PostgresConfig{
 		DSN:      postgresTestDSN,
 		MaxConns: 2,
 		MinConns: 1,
 	})
 	if err != nil {
-		t.Skipf("PostgreSQL not available, skipping: %v", err)
+		t.Fatalf("NewPostgresAuditLog with tuned pool config: %v", err)
 	}
 	defer log.Close()
 

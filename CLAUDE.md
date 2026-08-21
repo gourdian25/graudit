@@ -143,9 +143,16 @@ matching grcache's and gourdiantoken's own test connection strings exactly.
   assigned inside that transaction, **never** a `BIGSERIAL` column (a
   sequence advances even on rollback, silently creating a gap that would
   be indistinguishable from tampering). The primary key is `(chain_id,
-  entry_id)`. Schema is applied on connect via an embedded `//go:embed`
-  schema string, serialized by a *separate* Postgres advisory lock
-  (`grauditSchemaLockKey`, distinct from the per-Record `chainLockKey`).
+  entry_id)`. **`NewPostgresAuditLog` never applies schema itself** (as of
+  `v0.6.0` — see `docs/architecture.md`'s "`NewPostgresAuditLog` never
+  applies its own schema" section and `CHANGELOG.md`'s `[0.6.0]` entry): the
+  embedded `//go:embed` schema string is exposed via the exported
+  `PostgresSchemaSQL() string`, which the caller applies through their own
+  project's migration tool before ever constructing an `AuditLog`. The
+  unexported `applyPostgresSchema` helper and its serializing advisory lock
+  (`grauditSchemaLockKey`, distinct from the per-Record `chainLockKey`)
+  still exist but are now called only by graudit's own test setup
+  (`postgres_test.go`'s `truncatePostgresTestDB`), never by production code.
   `PostgresConfig` accepts exactly one of `DSN` (dials its own pool) or
   `Pool` (reuses an already-open `*pgxpool.Pool` the caller owns, e.g.
   shared across hundreds of tenant chains) — resolved by the

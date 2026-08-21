@@ -27,19 +27,30 @@ const postgresTestDSN = "host=localhost user=postgres_user password=postgres_pas
 // (unlike the memory backend, which is fresh by construction), and later
 // contract scenarios would otherwise see entries left behind by earlier
 // ones and fail with ID/hash mismatches that look like corruption but are
-// actually just test-isolation bugs. Errors are ignored (surfaced properly
-// by the subsequent NewPostgresAuditLog call's own connect/ping instead) so
-// this is safe to call even when Postgres isn't reachable at all.
+// actually just test-isolation bugs. Pool-creation errors are ignored
+// (surfaced properly by the subsequent NewPostgresAuditLog call's own
+// connect/ping instead) so this is safe to call even when Postgres isn't
+// reachable at all.
 //
-// DROP TABLE (not TRUNCATE): this table's schema itself changes across
-// graudit versions (e.g. the chain_id column/composite primary key added
-// for multi-chain support) — CREATE TABLE IF NOT EXISTS inside
-// NewPostgresAuditLog no-ops against an existing, differently-shaped
-// table, so TRUNCATE alone would silently leave a locally-iterated-on test
-// database on the old schema and fail every test with a confusing "column
-// does not exist" error instead of an obviously schema-related one.
-// Dropping and letting schema application recreate it from scratch makes
+// DROP TABLE (not TRUNCATE) *then* re-apply the schema, in that exact
+// order: this table's schema itself changes across graudit versions (e.g.
+// the chain_id column/composite primary key added for multi-chain
+// support), so TRUNCATE alone would silently leave a locally-iterated-on
+// test database on the old schema and fail every test with a confusing
+// "column does not exist" error instead of an obviously schema-related
+// one. Dropping and explicitly recreating it via applyPostgresSchema makes
 // the local/CI loop self-healing across any future schema change too.
+//
+// applyPostgresSchema must run *after* the DROP, not before: unlike
+// gourdiantoken's own equivalent test helper (which re-applies schema
+// before its TRUNCATE statements, since TRUNCATE never drops the table
+// itself), graudit's cleanup step here actually drops graudit_entries — so
+// applying schema first and dropping second would just recreate the table
+// and then immediately discard it again, leaving nothing for
+// NewPostgresAuditLog to see (it no longer applies schema itself — see
+// postgres.go's PostgresSchemaSQL doc comment) and every subsequent
+// Record/Query call failing with "relation does not exist" instead of
+// running against a clean table.
 func truncatePostgresTestDB() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -50,9 +61,17 @@ func truncatePostgresTestDB() {
 	}
 	defer pool.Close()
 
-	// Ignored if the table doesn't exist yet — schema application inside
-	// NewPostgresAuditLog creates it on first connect.
+	// Ignored if the table doesn't exist yet — applyPostgresSchema below
+	// (re)creates it regardless.
 	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS graudit_entries")
+
+	// graudit's own test setup, not a real consumer: applies the schema
+	// directly rather than through a migration tool, since this is a
+	// throwaway local/CI test database this process fully controls. Error
+	// ignored for the same reason as the DROP above — a genuine failure
+	// here (e.g. Postgres going away between the two calls) is surfaced by
+	// the subsequent NewPostgresAuditLog call's own connect/ping instead.
+	_ = applyPostgresSchema(ctx, pool)
 }
 
 func newPostgresLog() (AuditLog, error) {
@@ -258,6 +277,14 @@ func TestPostgresAuditLog_SharedPool_CloseDoesNotClosePool(t *testing.T) {
 	_ = log2.Close()
 }
 
+// TestPostgresSchemaApplyIsIdempotent proves repeated schema application
+// against the same database is safe (CREATE TABLE/INDEX IF NOT EXISTS,
+// never erroring on the second run). NewPostgresAuditLog itself no longer
+// applies schema at all (see postgres.go), so this now exercises that
+// property through newPostgresLog's own explicit applyPostgresSchema call
+// (via truncatePostgresTestDB) instead — calling it twice in a row is
+// exactly what every test in this file already does implicitly, one call
+// at a time; this test just makes the property explicit.
 func TestPostgresSchemaApplyIsIdempotent(t *testing.T) {
 	log1, err := newPostgresLog()
 	if err != nil {

@@ -194,11 +194,18 @@ each backend's serialization strategy in detail.
 | Backend | Constructor | Use case | Serialization |
 |---|---|---|---|
 | In-memory | `NewMemoryAuditLog` | Test/dev only — never for anything you need to keep | `sync.Mutex` |
-| PostgreSQL | `NewPostgresAuditLog` | Production | `pg_advisory_xact_lock` + explicitly-assigned `EntryID` |
+| PostgreSQL | `NewPostgresAuditLog` | Production (schema applied via your own migration tool) | `pg_advisory_xact_lock` + explicitly-assigned `EntryID` |
 | MongoDB | `NewMongoAuditLog` | Production (requires a replica set) | Multi-document ACID transaction |
 
 ```go
-// Postgres — pgx/v5 with sqlc-generated queries, no ORM.
+// Postgres — pgx/v5 with sqlc-generated queries, no ORM. graudit never
+// applies its own schema: apply graudit.PostgresSchemaSQL() through your
+// own project's migration tool (golang-migrate, Flyway, a plain SQL file
+// in CI, ...) once, before ever constructing an AuditLog — see
+// docs/architecture.md's "NewPostgresAuditLog never applies its own
+// schema" section. Skipping this doesn't fail construction itself; it
+// fails the first Record/Query/... call instead, with a plain Postgres
+// "relation does not exist" error.
 auditLog, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{
 	DSN: "host=localhost user=myuser password=mypass dbname=mydb port=5432 sslmode=disable",
 })
