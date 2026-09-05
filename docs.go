@@ -141,7 +141,7 @@
 //     log_, err := graudit.NewPostgresAuditLog(graudit.PostgresConfig{Pool: sharedPool})
 //
 //  3. MongoDB (NewMongoAuditLog) — production-eligible, durable. Uses
-//     go.mongodb.org/mongo-driver v1. Chain serialization is a
+//     go.mongodb.org/mongo-driver/v2. Chain serialization is a
 //     multi-document ACID transaction (session.WithTransaction) covering a
 //     singleton chain-state document and the new entry's insert. Requires
 //     the target deployment to be a replica set (even single-node)

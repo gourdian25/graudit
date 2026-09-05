@@ -17,9 +17,9 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.mongodb.org/mongo-driver/bson"
-	mongodriver "go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	mongodriver "go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/gourdian25/graudit/internal/postgresdb"
 )
@@ -339,7 +339,7 @@ func TestMongoAuditLog_VerifyDetectsChainLinkageBreak(t *testing.T) {
 		}
 	}
 
-	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(mongoTestURI))
+	client, err := mongodriver.Connect(options.Client().ApplyURI(mongoTestURI))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -552,7 +552,7 @@ func TestMongoAuditLog_GetEntry_InvalidStoredPayload(t *testing.T) {
 		t.Fatalf("Record: %v", err)
 	}
 
-	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(mongoTestURI))
+	client, err := mongodriver.Connect(options.Client().ApplyURI(mongoTestURI))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -580,7 +580,7 @@ func TestNewMongoAuditLog_EnsureIndexesFailsOnDuplicateEntryID(t *testing.T) {
 	dropMongoTestDB()
 
 	ctx := context.Background()
-	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(mongoTestURI))
+	client, err := mongodriver.Connect(options.Client().ApplyURI(mongoTestURI))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestMongoAuditLog_Record_ChainStateReplaceRejectedByValidator(t *testing.T)
 		t.Fatalf("seed Record: %v", err)
 	}
 
-	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(mongoTestURI))
+	client, err := mongodriver.Connect(options.Client().ApplyURI(mongoTestURI))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}

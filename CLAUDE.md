@@ -160,8 +160,7 @@ matching grcache's and gourdiantoken's own test connection strings exactly.
   `PostgresConfig.Pool`/`connectPostgres`/`ownsPool` pattern; `Close()`
   only closes the pool when this `AuditLog` dialed it itself.
 - **`mongo.go`** (`mongoAuditLog`) — production-eligible, via
-  `go.mongodb.org/mongo-driver` **v1** (not `/v2` — breaking rewrite, out
-  of scope). Chain serialization is a multi-document ACID transaction
+  `go.mongodb.org/mongo-driver/v2`. Chain serialization is a multi-document ACID transaction
   (`session.WithTransaction`) covering a singleton chain-state document
   (`_id` = the real `chainID` string, one document per chain) and the new
   entry's insert — no lock needed at all, since concurrent `Record` calls

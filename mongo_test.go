@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	mongodriver "go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	mongodriver "go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // mongoTestURI must point at a replica set (single-node is sufficient) —
@@ -42,7 +42,7 @@ const mongoTestDatabase = "graudit_test"
 func dropMongoTestDB() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(mongoTestURI))
+	client, err := mongodriver.Connect(options.Client().ApplyURI(mongoTestURI))
 	if err != nil {
 		return
 	}
@@ -67,7 +67,7 @@ func tamperMongoEntry(t *testing.T, log AuditLog, chainID string, entryID EntryI
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(mongoTestURI))
+	client, err := mongodriver.Connect(options.Client().ApplyURI(mongoTestURI))
 	if err != nil {
 		t.Fatalf("connect for tamper: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestMongoAuditLog_Query_InvalidStoredPayload(t *testing.T) {
 		t.Fatalf("Record: %v", err)
 	}
 
-	client, err := mongodriver.Connect(ctx, options.Client().ApplyURI(mongoTestURI))
+	client, err := mongodriver.Connect(options.Client().ApplyURI(mongoTestURI))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
