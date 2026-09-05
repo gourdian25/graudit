@@ -1,11 +1,10 @@
 // File: mongo.go
 
 // MongoDB backend (mongoAuditLog) for graudit — production-eligible and
-// durable. Uses go.mongodb.org/mongo-driver v1 (the same driver family
-// grcache and gourdiantoken depend on) — the v1 module is
-// upstream-deprecated in favor of go.mongodb.org/mongo-driver/v2, but
-// migrating to that would be a breaking API rewrite out of scope for a
-// routine dependency choice.
+// durable. Uses go.mongodb.org/mongo-driver/v2 (v1 is upstream-deprecated;
+// this backend migrated to v2 in full, including the session.WithTransaction
+// callback signature change from mongo.SessionContext to a plain
+// context.Context — see probeTransactionSupport and Record below).
 //
 // The chain's single-writer serialization point is a multi-document ACID
 // transaction (session.WithTransaction) covering a singleton chain-state
@@ -42,10 +41,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/gourdian25/grevents"
 )
@@ -166,7 +165,11 @@ func NewMongoAuditLog(cfg MongoConfig) (AuditLog, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(cfg.URI))
+	// v2's mongo.Connect no longer takes a context (it doesn't block on the
+	// network — it only starts background topology monitoring), so the
+	// timeout below now bounds the subsequent Ping call instead, which
+	// remains the real connectivity check.
+	client, err := mongo.Connect(options.Client().ApplyURI(cfg.URI))
 	if err != nil {
 		appLogger.Error("graudit: connect failed", "error", err)
 		return nil, fmt.Errorf("graudit: connect: %w", ErrBackendUnavailable)
@@ -220,11 +223,15 @@ func probeTransactionSupport(ctx context.Context, client *mongo.Client, chainCol
 	}
 	defer session.EndSession(ctx)
 
-	_, err = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
-		if _, err := chainColl.InsertOne(sc, bson.M{"_id": probeDocID}); err != nil {
+	// v2's Session.WithTransaction callback receives a plain
+	// context.Context (the session travels inside it) rather than v1's
+	// mongo.SessionContext type, so it's passed straight through to every
+	// inner operation below.
+	_, err = session.WithTransaction(ctx, func(txCtx context.Context) (interface{}, error) {
+		if _, err := chainColl.InsertOne(txCtx, bson.M{"_id": probeDocID}); err != nil {
 			return nil, err
 		}
-		if _, err := chainColl.DeleteOne(sc, bson.M{"_id": probeDocID}); err != nil {
+		if _, err := chainColl.DeleteOne(txCtx, bson.M{"_id": probeDocID}); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -282,9 +289,11 @@ func (a *mongoAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID, 
 	// session.WithTransaction already retries internally on
 	// TransientTransactionError/UnknownTransactionCommitResult — do not add
 	// a second, manual outer retry loop around it; that would be redundant.
-	_, err = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+	// The callback receives a plain context.Context in v2 (see
+	// probeTransactionSupport above), passed straight through below.
+	_, err = session.WithTransaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		var tail mongoChainState
-		tailErr := a.chainColl.FindOne(sc, bson.M{"_id": event.ChainID}).Decode(&tail)
+		tailErr := a.chainColl.FindOne(txCtx, bson.M{"_id": event.ChainID}).Decode(&tail)
 		prevHash := GenesisPrevHash
 		nextID := EntryID(1)
 		switch {
@@ -305,11 +314,11 @@ func (a *mongoAuditLog) Record(ctx context.Context, event AuditEvent) (EntryID, 
 			ChainID: event.ChainID, EntryID: uint64(nextID), ActorID: event.ActorID, EntityType: event.EntityType, EntityID: event.EntityID,
 			Action: event.Action, Payload: payloadBytes, Timestamp: event.Timestamp, Hash: hash, PrevHash: prevHash,
 		}
-		if _, err := a.entries.InsertOne(sc, doc); err != nil {
+		if _, err := a.entries.InsertOne(txCtx, doc); err != nil {
 			return nil, err
 		}
 
-		if _, err := a.chainColl.ReplaceOne(sc, bson.M{"_id": event.ChainID},
+		if _, err := a.chainColl.ReplaceOne(txCtx, bson.M{"_id": event.ChainID},
 			mongoChainState{ID: event.ChainID, LastEntryID: uint64(nextID), LastHash: hash},
 			options.Replace().SetUpsert(true)); err != nil {
 			return nil, err

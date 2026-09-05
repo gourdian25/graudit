@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-09-05
+
+Migrates the Mongo backend from `go.mongodb.org/mongo-driver` (v1,
+upstream-deprecated) to `go.mongodb.org/mongo-driver/v2`, matching
+grsentry's already-completed migration and bringing graudit in line with
+the rest of the `gourdian25` org. `MongoConfig`/`NewMongoAuditLog` never
+exposed a driver type in their exported signature — every `*mongo.Client`/
+`*mongo.Collection` reference is confined to unexported fields and
+unexported helper functions (`probeTransactionSupport`,
+`ensureAuditIndexes`) — so this is an internal dependency swap only, no
+change to `NewMongoAuditLog`'s signature or behavior for graudit's own
+consumers.
+
+### Changed
+
+- `mongo.go` now imports `go.mongodb.org/mongo-driver/v2/{bson,mongo,mongo/options,mongo/readpref}`.
+  `mongo.Connect` dropped its `context.Context` parameter in v2 (it never
+  blocked on the network — `Ping` remains the real connectivity check), so
+  the 5s connect timeout that used to bound `Connect` now bounds the
+  subsequent `Ping` call instead.
+- `mongo.SessionContext` is removed in v2 — `session.WithTransaction`'s
+  callback now takes a plain `context.Context` rather than the old wrapper
+  type, with the session travelling inside the context itself.
+  `probeTransactionSupport` and `Record` (the two `WithTransaction` call
+  sites) are rewritten accordingly; every inner `InsertOne`/`DeleteOne`/
+  `FindOne`/`ReplaceOne` call inside those closures now takes the
+  callback's context parameter directly instead of a session-context
+  variable. Behavior is unchanged — `session.WithTransaction` still retries
+  internally on `TransientTransactionError`/`UnknownTransactionCommitResult`,
+  as before.
+- `client.Ping(ctx, readpref.Primary())`, `readpref.Primary()`, and
+  `options.Replace().SetUpsert(true)` are unchanged.
+- `go.mod`: `go.mongodb.org/mongo-driver v1.17.9` replaced with
+  `go.mongodb.org/mongo-driver/v2 v2.8.0`; no longer present at any version,
+  direct or indirect.
+
+### Documentation
+
+- `docs.go`'s MongoDB backend description and `mongo.go`'s own file-header
+  comment (previously explaining why graudit stayed on v1: "a breaking API
+  rewrite, out of scope for a routine dependency choice") both updated to
+  describe the completed v2 migration. `CLAUDE.md`'s equivalent v1 caveat
+  removed the same way.
+
 ## [0.6.0] - 2026-08-14
 
 **Breaking, for the Postgres backend only.** Closes a gap found while
