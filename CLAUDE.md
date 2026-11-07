@@ -36,7 +36,8 @@ make bench            # go test -bench=. -benchmem -benchtime=10s ./...  (runs B
 make lint             # golangci-lint run ./...
 make vet              # go vet ./...
 make fmt              # gofmt
-make docker-up        # start the shared Postgres/Mongo(auth)/Mongo(standalone) test containers (idempotent)
+make docker-up        # start the shared Postgres/Mongo(auth) containers (grsentry's docker-compose.yml) + graudit's own Mongo(standalone), create graudit_test (idempotent)
+make docker-create    # fallback docker-up uses when ../grsentry isn't checked out: docker run, mirroring that compose file
 make docker-down      # stop those containers (state preserved for a fast restart)
 make release VERSION=vX.Y.Z   # tag, push, goreleaser release --clean
 make goreleaser-check         # dry run: goreleaser check + --snapshot --clean
@@ -55,35 +56,23 @@ exception: the second, standalone Mongo container below exists only for
 this repo's own replica-set-required regression test. Run `make docker-up`
 to start (or reuse already-running) shared containers.
 
-```sh
-docker run -d --name gourdian-postgres -p 5432:5432 \
-  -e POSTGRES_USER=postgres_user -e POSTGRES_PASSWORD=postgres_password postgres:16
-createdb -U postgres_user -h localhost graudit_test
+The shared containers are grsentry's: `make docker-up` creates any missing
+one from `../grsentry/docker-compose.yml` (Postgres 18 on 5432, Mongo 8.3 as
+an authenticated single-node replica set `rs0` listening on 27018 inside and
+outside its container), or with `make docker-create`'s `docker run` mirror of
+that file when grsentry isn't checked out beside this repo. It then creates
+`graudit_test`, initiates the replica set if needed and waits for a PRIMARY.
 
-# Auth + --replSet requires a --keyFile (MongoDB enforces this even for a
-# single-node set) — generate one once, in a named volume so file
-# permissions/ownership survive correctly across container recreation:
-docker volume create gourdian-mongo-keyfile
-docker run --rm -v gourdian-mongo-keyfile:/keyfile-dir mongo:7 bash -c \
-  "openssl rand -base64 756 > /keyfile-dir/mongo-keyfile && chmod 400 /keyfile-dir/mongo-keyfile && chown 999:999 /keyfile-dir/mongo-keyfile"
-docker run -d --name gourdian-mongo-auth -p 27018:27017 \
-  -e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=mongo_password \
-  -v gourdian-mongo-keyfile:/etc/mongo-keyfile-dir \
-  mongo:7 --replSet rs0 --keyFile /etc/mongo-keyfile-dir/mongo-keyfile
-docker exec gourdian-mongo-auth mongosh -u root -p mongo_password \
-  --authenticationDatabase admin --eval 'rs.initiate()'
-
-# A second, genuinely standalone (no --replSet, no auth) instance is also
-# required — TestNewMongoAuditLog_RequiresReplicaSet in mongo_test.go needs
-# it, and must never be skipped/reverted to skipping: a pre-v0.1.0 audit
-# found that probeTransactionSupport's original no-op transaction body
-# never sent a real transaction-start command to the server, so it
-# silently reported "transactions supported" even against a standalone
-# deployment — this test is the only thing that catches that class of
-# bug. Fixed by making the probe perform a real (self-cleaning) write
-# inside the transaction.
-docker run -d --name gourdian-mongo-standalone -p 27019:27017 mongo:7
-```
+A second, genuinely standalone (no `--replSet`, no auth) instance,
+`gourdian-mongo-standalone` on 27019, is graudit's alone and always run by
+`make docker-up`. `TestNewMongoAuditLog_RequiresReplicaSet` in
+`mongo_test.go` needs it, and must never be skipped/reverted to skipping: a
+pre-v0.1.0 audit found that `probeTransactionSupport`'s original no-op
+transaction body never sent a real transaction-start command to the server,
+so it silently reported "transactions supported" even against a standalone
+deployment — this test is the only thing that catches that class of bug.
+Fixed by making the probe perform a real (self-cleaning) write inside the
+transaction.
 
 The Mongo backend **requires** the instance to be a replica set (single-node
 is sufficient) — `NewMongoAuditLog` fails fast, wrapping
