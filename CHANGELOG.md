@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-11-08
+
+### Changed
+
+- Licence: standard MIT text, copyright holder Manish Kumar. No change to the terms granted.
+- README: added badges, corrected the grpolicy description.
+- `go.sum`: added the entries the dependency update needs, so a standalone build works.
+- Makefile: `docker-up` uses the shared containers from grsentry's `docker-compose.yml` (creating missing ones from it, or with the new `docker-create` fallback), checks Mongo on its real port 27018, and gives up after 60 s instead of waiting forever.
+- Dependencies: grevents v0.2.1, grlog v0.1.3.
+
 ## [0.7.0] - 2026-09-05
 
 Migrates the Mongo backend from `go.mongodb.org/mongo-driver` (v1,

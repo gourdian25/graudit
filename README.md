@@ -1,5 +1,9 @@
 # graudit
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/gourdian25/graudit.svg)](https://pkg.go.dev/github.com/gourdian25/graudit)
+[![Go Version](https://img.shields.io/badge/go-1.26.4+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 Append-only, tamper-evident audit trail for the gourdian ecosystem.
 
 graudit answers "what changed, who did it, and can we prove the record
@@ -24,7 +28,7 @@ together:
   bus; graudit publishes an `"audit.recorded"` event through it on every
   successful write (see below).
 - [grpolicy](https://github.com/gourdian25/grpolicy) — attribute-based
-  policy evaluation (RBAC/ABAC), independent of any notion of "user" or
+  policy evaluation, independent of any notion of "user" or
   "role".
 - [grnoti](https://github.com/gourdian25/grnoti) — a push-notification
   service (FCM dispatch, idempotent event processing, device-token
