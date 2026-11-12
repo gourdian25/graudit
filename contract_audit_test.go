@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,7 +44,8 @@ const (
 // dependency to be unavailable.
 func TestAuditLog_Contract(t *testing.T) {
 	t.Run("Memory", func(t *testing.T) {
-		runAuditContract(t, newMemoryLog, newMemoryLogWithBus, withTamperHook(tamperMemoryEntry))
+		runAuditContract(t, newMemoryLog, newMemoryLogWithBus, withTamperHook(tamperMemoryEntry),
+			withLinkHooks(rehashMemoryEntry, deleteMemoryEntry))
 	})
 
 	t.Run("Postgres", func(t *testing.T) {
@@ -52,7 +54,8 @@ func TestAuditLog_Contract(t *testing.T) {
 			t.Skipf("PostgreSQL not available, skipping: %v", err)
 		}
 		_ = log.Close()
-		runAuditContract(t, newPostgresLog, newPostgresLogWithBus, withTamperHook(tamperPostgresEntry))
+		runAuditContract(t, newPostgresLog, newPostgresLogWithBus, withTamperHook(tamperPostgresEntry),
+			withLinkHooks(rehashPostgresEntry, deletePostgresEntry))
 	})
 
 	t.Run("Mongo", func(t *testing.T) {
@@ -61,7 +64,8 @@ func TestAuditLog_Contract(t *testing.T) {
 			t.Skipf("MongoDB not available, skipping: %v", err)
 		}
 		_ = log.Close()
-		runAuditContract(t, newMongoLog, newMongoLogWithBus, withTamperHook(tamperMongoEntry))
+		runAuditContract(t, newMongoLog, newMongoLogWithBus, withTamperHook(tamperMongoEntry),
+			withLinkHooks(rehashMongoEntry, deleteMongoEntry))
 	})
 }
 
@@ -82,6 +86,24 @@ type tamperHookFunc func(t *testing.T, log AuditLog, chainID string, entryID Ent
 
 type auditContractConfig struct {
 	tamperHook tamperHookFunc
+	rehashHook tamperHookFunc
+	deleteHook tamperHookFunc
+}
+
+// tamperedHash is what a rehash hook stores as an entry's Hash: a valid
+// SHA-256 hex shape that no real entry's hash equals.
+var tamperedHash = strings.Repeat("f", 64)
+
+// withLinkHooks supplies the backend-specific mechanisms
+// testVerifyWindowLinks needs, both bypassing the AuditLog interface as
+// tamperHookFunc does: rehash overwrites one entry's stored Hash with
+// tamperedHash, del removes one entry. Each is a hook of tamperHookFunc's
+// shape; omitted, testVerifyWindowLinks is skipped.
+func withLinkHooks(rehash, del tamperHookFunc) auditContractOption {
+	return func(cfg *auditContractConfig) {
+		cfg.rehashHook = rehash
+		cfg.deleteHook = del
+	}
 }
 
 // withTamperHook supplies the backend-specific mechanism for
@@ -121,6 +143,8 @@ func runAuditContract(t *testing.T, newLog newLogFunc, newLogWithBus newLogWithB
 	t.Run("ConcurrentRecordStressMultiChain", func(t *testing.T) { testConcurrentRecordStressMultiChain(t, newLog) })
 	t.Run("HashDeterminism", func(t *testing.T) { testHashDeterminism(t, newLog) })
 	t.Run("VerifyDetectsTamper", func(t *testing.T) { testVerifyDetectsTamper(t, newLog, cfg.tamperHook) })
+	t.Run("VerifyWindows", func(t *testing.T) { testVerifyWindows(t, newLog, cfg.tamperHook) })
+	t.Run("VerifyWindowLinks", func(t *testing.T) { testVerifyWindowLinks(t, newLog, cfg.rehashHook, cfg.deleteHook) })
 	t.Run("RecordChangeDiff", func(t *testing.T) { testRecordChangeDiff(t, newLog) })
 	t.Run("QueryFilters", func(t *testing.T) { testQueryFilters(t, newLog) })
 	t.Run("ChainIsolation", func(t *testing.T) { testChainIsolation(t, newLog) })
@@ -439,6 +463,102 @@ func testVerifyDetectsTamper(t *testing.T, newLog newLogFunc, tamperHook tamperH
 	if detail.BrokenAt != tamperedID {
 		t.Fatalf("VerifyResult.BrokenAt = %d, want %d", detail.BrokenAt, tamperedID)
 	}
+}
+
+// recordN records n entries on testChainID and returns the log.
+func recordN(t *testing.T, newLog newLogFunc, n int) AuditLog {
+	t.Helper()
+	log, err := newLog()
+	if err != nil {
+		t.Fatalf("newLog: %v", err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	for i := 0; i < n; i++ {
+		if _, err := log.Record(context.Background(), AuditEvent{ChainID: testChainID, ActorID: "actor:1", EntityType: "widget", EntityID: fmt.Sprintf("w%d", i), Action: "create"}); err != nil {
+			t.Fatalf("Record #%d: %v", i, err)
+		}
+	}
+	return log
+}
+
+// verifyWant runs Verify(from, to) and fails unless it reports ok, or a
+// break at brokenAt when brokenAt is non-zero. It returns the detail.
+func verifyWant(t *testing.T, log AuditLog, from, to, brokenAt EntryID) VerifyResult {
+	t.Helper()
+	ok, detail, err := log.Verify(context.Background(), testChainID, from, to)
+	if err != nil {
+		t.Fatalf("Verify(%d, %d): %v", from, to, err)
+	}
+	if brokenAt == 0 && (!ok || !detail.Valid) {
+		t.Fatalf("Verify(%d, %d) = ok=%v %+v, want valid", from, to, ok, detail)
+	}
+	if brokenAt != 0 && (ok || detail.BrokenAt != brokenAt) {
+		t.Fatalf("Verify(%d, %d) = ok=%v %+v, want broken at %d", from, to, ok, detail, brokenAt)
+	}
+	return detail
+}
+
+// testVerifyWindows: a chain verifies in consecutive windows, each one
+// starting past entry 1 linked to its predecessor's stored Hash (v0.7.2;
+// before it, every such window read as broken at its first entry). A
+// tampered entry breaks every window holding it, and only those.
+func testVerifyWindows(t *testing.T, newLog newLogFunc, tamperHook tamperHookFunc) {
+	t.Helper()
+	const n = 10
+	log := recordN(t, newLog, n)
+
+	verifyWant(t, log, 1, 5, 0)
+	verifyWant(t, log, 6, n, 0)
+	verifyWant(t, log, 6, 0, 0)
+	verifyWant(t, log, 2, 2, 0)
+	verifyWant(t, log, n, n, 0)
+	verifyWant(t, log, n+1, 0, 0) // past the tail: nothing to fail
+
+	if tamperHook == nil {
+		t.Skip("no withTamperHook supplied for this backend")
+	}
+	tamperHook(t, log, testChainID, 7)
+	verifyWant(t, log, 6, n, 7)
+	verifyWant(t, log, 7, 7, 7)
+	verifyWant(t, log, 1, 6, 0)
+	// 7's stored Hash is unchanged, so a window after it still links: a
+	// window proves its own entries and their link to the one before.
+	verifyWant(t, log, 8, n, 0)
+}
+
+// testVerifyWindowLinks: a window's first entry is checked against its
+// predecessor's stored Hash, so a rewritten Hash on the entry before the
+// window, or that entry deleted, is a break at the window's first entry,
+// reported as a result, never an error.
+func testVerifyWindowLinks(t *testing.T, newLog newLogFunc, rehashHook, deleteHook tamperHookFunc) {
+	t.Helper()
+	if rehashHook == nil || deleteHook == nil {
+		t.Skip("no withLinkHooks supplied for this backend")
+	}
+
+	t.Run("RewrittenPredecessorHash", func(t *testing.T) {
+		const n = 10
+		log := recordN(t, newLog, n)
+		rehashHook(t, log, testChainID, 5)
+		detail := verifyWant(t, log, 6, n, 6)
+		if detail.Expected != tamperedHash {
+			t.Fatalf("Expected = %q, want the predecessor's stored (rewritten) Hash", detail.Expected)
+		}
+		verifyWant(t, log, 1, 4, 0)
+		verifyWant(t, log, 7, n, 0)
+	})
+
+	t.Run("DeletedPredecessor", func(t *testing.T) {
+		const n = 10
+		log := recordN(t, newLog, n)
+		deleteHook(t, log, testChainID, 5)
+		detail := verifyWant(t, log, 6, n, 6)
+		if detail.Expected != "" {
+			t.Fatalf("Expected = %q, want empty for a missing predecessor", detail.Expected)
+		}
+		verifyWant(t, log, 1, 4, 0)
+		verifyWant(t, log, 7, n, 0)
+	})
 }
 
 func testRecordChangeDiff(t *testing.T, newLog newLogFunc) {

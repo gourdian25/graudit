@@ -83,6 +83,50 @@ func tamperMongoEntry(t *testing.T, log AuditLog, chainID string, entryID EntryI
 	}
 }
 
+// rehashMongoEntry overwrites one entry's stored Hash (withLinkHooks).
+func rehashMongoEntry(t *testing.T, _ AuditLog, chainID string, entryID EntryID) {
+	t.Helper()
+	withMongoTamper(t, func(ctx context.Context, coll *mongodriver.Collection) (int64, error) {
+		res, err := coll.UpdateOne(ctx, bson.M{"chainId": chainID, "entryId": uint64(entryID)}, bson.M{"$set": bson.M{"hash": tamperedHash}})
+		if err != nil {
+			return 0, err
+		}
+		return res.ModifiedCount, nil
+	})
+}
+
+// deleteMongoEntry removes one entry (withLinkHooks).
+func deleteMongoEntry(t *testing.T, _ AuditLog, chainID string, entryID EntryID) {
+	t.Helper()
+	withMongoTamper(t, func(ctx context.Context, coll *mongodriver.Collection) (int64, error) {
+		res, err := coll.DeleteOne(ctx, bson.M{"chainId": chainID, "entryId": uint64(entryID)})
+		if err != nil {
+			return 0, err
+		}
+		return res.DeletedCount, nil
+	})
+}
+
+// withMongoTamper runs one change that must touch exactly one document, on
+// its own client to the test URI, as tamperMongoEntry does.
+func withMongoTamper(t *testing.T, change func(context.Context, *mongodriver.Collection) (int64, error)) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := mongodriver.Connect(options.Client().ApplyURI(mongoTestURI))
+	if err != nil {
+		t.Fatalf("connect for tamper: %v", err)
+	}
+	defer client.Disconnect(ctx)
+	n, err := change(ctx, client.Database(mongoTestDatabase).Collection("graudit_entries"))
+	if err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("tamper touched %d documents, want 1", n)
+	}
+}
+
 func TestNewMongoAuditLog_MissingURI(t *testing.T) {
 	if _, err := NewMongoAuditLog(MongoConfig{Database: "x"}); err == nil {
 		t.Fatal("expected an error for a missing URI, got nil")

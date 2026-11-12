@@ -391,7 +391,7 @@ func (a *mongoAuditLog) Verify(ctx context.Context, chainID string, from, to Ent
 	}
 
 	cursor, err := a.entries.Find(ctx,
-		bson.M{"chainId": chainID, "entryId": bson.M{"$gte": uint64(from), "$lte": uint64(to)}},
+		bson.M{"chainId": chainID, "entryId": bson.M{"$gte": uint64(readFrom(from)), "$lte": uint64(to)}},
 		options.Find().SetSort(bson.D{{Key: "entryId", Value: 1}}))
 	if err != nil {
 		return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", ErrBackendUnavailable)
@@ -403,12 +403,18 @@ func (a *mongoAuditLog) Verify(ctx context.Context, chainID string, from, to Ent
 		return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", ErrBackendUnavailable)
 	}
 
-	var prevHash string
-	for i, doc := range docs {
-		expectPrev := GenesisPrevHash
-		if i > 0 {
-			expectPrev = prevHash
+	// From entry 2 on, docs starts at the range's predecessor (see
+	// rangeAnchor).
+	expectPrev := GenesisPrevHash
+	if from > 1 {
+		var anchor []string
+		if len(docs) > 0 && EntryID(docs[0].EntryID) == from-1 {
+			anchor = []string{docs[0].Hash}
+			docs = docs[1:]
 		}
+		expectPrev = rangeAnchor(anchor)
+	}
+	for _, doc := range docs {
 		if doc.PrevHash != expectPrev {
 			return false, VerifyResult{
 				Valid: false, BrokenAt: EntryID(doc.EntryID), Expected: expectPrev, Actual: doc.PrevHash,
@@ -429,7 +435,7 @@ func (a *mongoAuditLog) Verify(ctx context.Context, chainID string, from, to Ent
 			}, nil
 		}
 
-		prevHash = doc.Hash
+		expectPrev = doc.Hash
 	}
 	return true, VerifyResult{Valid: true}, nil
 }

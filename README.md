@@ -80,7 +80,9 @@ Each entry's `Hash` links it to the one before it, forming a chain per
 `ChainID`. `Verify(ctx, chainID, from, to)` walks a range and fails at the
 first entry whose stored `Hash` doesn't match one recomputed from its own
 fields (tampering), or whose stored `PrevHash` doesn't match the previous
-entry's stored `Hash` (a deleted or reordered entry):
+entry's stored `Hash` (a deleted or reordered entry). A range starting
+past entry 1 is linked to entry `from-1`'s stored `Hash`, so a long chain
+can be verified in consecutive windows (since v0.7.2):
 
 ```mermaid
 flowchart LR

@@ -30,6 +30,36 @@ func tamperMemoryEntry(t *testing.T, log AuditLog, chainID string, entryID Entry
 	t.Fatalf("tamperMemoryEntry: entry (chain %q, id %d) not found", chainID, entryID)
 }
 
+// rehashMemoryEntry overwrites one entry's stored Hash (withLinkHooks).
+func rehashMemoryEntry(t *testing.T, log AuditLog, chainID string, entryID EntryID) {
+	t.Helper()
+	a := log.(*memoryAuditLog)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.entries {
+		if a.entries[i].ChainID == chainID && a.entries[i].ID == entryID {
+			a.entries[i].Hash = tamperedHash
+			return
+		}
+	}
+	t.Fatalf("rehashMemoryEntry: entry (chain %q, id %d) not found", chainID, entryID)
+}
+
+// deleteMemoryEntry removes one entry (withLinkHooks).
+func deleteMemoryEntry(t *testing.T, log AuditLog, chainID string, entryID EntryID) {
+	t.Helper()
+	a := log.(*memoryAuditLog)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := range a.entries {
+		if a.entries[i].ChainID == chainID && a.entries[i].ID == entryID {
+			a.entries = append(a.entries[:i], a.entries[i+1:]...)
+			return
+		}
+	}
+	t.Fatalf("deleteMemoryEntry: entry (chain %q, id %d) not found", chainID, entryID)
+}
+
 func TestNewMemoryAuditLog_NeverFails(t *testing.T) {
 	if _, err := NewMemoryAuditLog(); err != nil {
 		t.Fatalf("NewMemoryAuditLog: %v, want nil", err)

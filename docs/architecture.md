@@ -259,6 +259,26 @@ two independent checks per entry:
 this correctly identifies the first tampered/broken entry regardless of
 how many entries follow it in the requested range.
 
+### Ranges that start past entry 1 (v0.7.2)
+
+Check B needs a "previous entry" for the range's first entry too. For a
+range from entry 1 that is `GenesisPrevHash`. For a range starting at
+`from > 1`, every backend reads one entry earlier (`readFrom`) and takes
+entry `from-1`'s stored `Hash` as the first entry's expected `PrevHash`
+(`rangeAnchor`). Entry `from-1` itself is not checked (it's outside the
+range), so a window proves its own entries and their link to the entry
+before, and consecutive windows together prove the whole chain, which is
+how a caller verifies a long chain without loading it in one query. A
+missing `from-1` while the range holds entries is a break at the range's
+first entry with an empty `Expected`: a deleted entry is tampering, so it
+is a result, never an error.
+
+Before v0.7.2 every backend checked the first entry of *any* range against
+`GenesisPrevHash`, so every range starting past entry 1 reported
+`BrokenAt == from` on an untouched chain. No test verified such a range;
+`VerifyWindows` and `VerifyWindowLinks` in the contract suite now do, for
+every backend.
+
 ## `GetEntry`/`LatestEntryID`, and `Verify`'s `to==0` sentinel
 
 Before these were added, fetching one entry by `EntryID` required an

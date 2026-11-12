@@ -477,17 +477,23 @@ func (a *postgresAuditLog) Verify(ctx context.Context, chainID string, from, to 
 		to = latest
 	}
 
-	rows, err := a.q.ListEntriesInRange(ctx, postgresdb.ListEntriesInRangeParams{ChainID: chainID, FromID: toPgEntryID(from), ToID: toPgEntryID(to)})
+	// From entry 2 on, the range is read from its predecessor, whose stored
+	// Hash is what the range's first PrevHash must equal (see rangeAnchor).
+	rows, err := a.q.ListEntriesInRange(ctx, postgresdb.ListEntriesInRangeParams{ChainID: chainID, FromID: toPgEntryID(readFrom(from)), ToID: toPgEntryID(to)})
 	if err != nil {
 		return false, VerifyResult{}, fmt.Errorf("graudit: verify: %w", ErrBackendUnavailable)
 	}
 
-	var prevHash string
-	for i, row := range rows {
-		expectPrev := GenesisPrevHash
-		if i > 0 {
-			expectPrev = prevHash
+	expectPrev := GenesisPrevHash
+	if from > 1 {
+		var anchor []string
+		if len(rows) > 0 && pgEntryID(rows[0].EntryID) == from-1 {
+			anchor = []string{rows[0].Hash}
+			rows = rows[1:]
 		}
+		expectPrev = rangeAnchor(anchor)
+	}
+	for _, row := range rows {
 		if row.PrevHash != expectPrev {
 			return false, VerifyResult{
 				Valid: false, BrokenAt: pgEntryID(row.EntryID), Expected: expectPrev, Actual: row.PrevHash,
@@ -508,7 +514,7 @@ func (a *postgresAuditLog) Verify(ctx context.Context, chainID string, from, to 
 			}, nil
 		}
 
-		prevHash = row.Hash
+		expectPrev = row.Hash
 	}
 	return true, VerifyResult{Valid: true}, nil
 }
