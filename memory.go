@@ -176,14 +176,23 @@ func (a *memoryAuditLog) Verify(ctx context.Context, chainID string, from, to En
 		to = latest
 	}
 	entries := make([]AuditEvent, 0, len(a.entries))
+	var anchor []string
 	for _, e := range a.entries {
-		if e.ChainID == chainID && e.ID >= from && e.ID <= to {
+		switch {
+		case e.ChainID != chainID:
+		case from > 1 && e.ID == from-1:
+			anchor = []string{e.Hash}
+		case e.ID >= from && e.ID <= to:
 			entries = append(entries, e)
 		}
 	}
 	a.mu.Unlock()
 
-	return verifyMemoryChain(entries)
+	expectPrev := GenesisPrevHash
+	if from > 1 {
+		expectPrev = rangeAnchor(anchor)
+	}
+	return verifyMemoryChain(entries, expectPrev)
 }
 
 // verifyMemoryChain applies the two required checks to entries (already
@@ -192,14 +201,10 @@ func (a *memoryAuditLog) Verify(ctx context.Context, chainID string, from, to En
 // against its stored Hash; Check B asserts each entry's stored PrevHash
 // equals the previous entry's stored Hash. Both are needed — Check A alone
 // would not detect a deleted entry or a rewritten PrevHash pointing at a
-// tampered predecessor.
-func verifyMemoryChain(entries []AuditEvent) (bool, VerifyResult, error) {
-	var prevHash string
-	for i, e := range entries {
-		expectPrev := GenesisPrevHash
-		if i > 0 {
-			expectPrev = prevHash
-		}
+// tampered predecessor. expectPrev is what the first entry's PrevHash
+// must be: GenesisPrevHash for a range from entry 1, else rangeAnchor's.
+func verifyMemoryChain(entries []AuditEvent, expectPrev string) (bool, VerifyResult, error) {
+	for _, e := range entries {
 		if e.PrevHash != expectPrev {
 			return false, VerifyResult{
 				Valid: false, BrokenAt: e.ID, Expected: expectPrev, Actual: e.PrevHash,
@@ -216,7 +221,7 @@ func verifyMemoryChain(entries []AuditEvent) (bool, VerifyResult, error) {
 			}, nil
 		}
 
-		prevHash = e.Hash
+		expectPrev = e.Hash
 	}
 	return true, VerifyResult{Valid: true}, nil
 }

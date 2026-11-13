@@ -107,6 +107,38 @@ func tamperPostgresEntry(t *testing.T, log AuditLog, chainID string, entryID Ent
 	}
 }
 
+// rehashPostgresEntry overwrites one entry's stored Hash (withLinkHooks).
+func rehashPostgresEntry(t *testing.T, _ AuditLog, chainID string, entryID EntryID) {
+	t.Helper()
+	execPostgresTamper(t, `UPDATE graudit_entries SET hash = $1 WHERE chain_id = $2 AND entry_id = $3`, tamperedHash, chainID, int64(entryID))
+}
+
+// deletePostgresEntry removes one entry (withLinkHooks).
+func deletePostgresEntry(t *testing.T, _ AuditLog, chainID string, entryID EntryID) {
+	t.Helper()
+	execPostgresTamper(t, `DELETE FROM graudit_entries WHERE chain_id = $1 AND entry_id = $2`, chainID, int64(entryID))
+}
+
+// execPostgresTamper runs one statement that must touch exactly one row,
+// on its own connection to the test DSN, as tamperPostgresEntry does.
+func execPostgresTamper(t *testing.T, sql string, args ...any) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, postgresTestDSN)
+	if err != nil {
+		t.Fatalf("connect for tamper: %v", err)
+	}
+	defer pool.Close()
+	tag, err := pool.Exec(ctx, sql, args...)
+	if err != nil {
+		t.Fatalf("tamper %q: %v", sql, err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("tamper %q affected %d rows, want 1", sql, tag.RowsAffected())
+	}
+}
+
 func TestNewPostgresAuditLog_MissingDSN(t *testing.T) {
 	if _, err := NewPostgresAuditLog(PostgresConfig{}); err == nil {
 		t.Fatal("expected an error for a missing DSN, got nil")

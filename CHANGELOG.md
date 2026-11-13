@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-11-13
+
+### Fixed
+
+- `Verify(ctx, chainID, from, to)` with `from > 1` reported every range as broken at `from`, untouched or not, in all three backends: the range's first entry was checked against `GenesisPrevHash` instead of entry `from-1`'s stored `Hash`. Each backend now reads one entry earlier and links the range to it, so a chain can be verified in consecutive windows. A missing `from-1` while the range holds entries is a break at `from` with an empty `VerifyResult.Expected`, never an error. Ranges from entry 1 are unchanged.
+
+### Added
+
+- Contract tests for every backend: `VerifyWindows` (consecutive windows on an untouched chain; a tampered entry breaks only the windows holding it) and `VerifyWindowLinks` (a rewritten or deleted predecessor breaks the window at its first entry).
+
 ## [0.7.1] - 2026-11-08
 
 ### Changed

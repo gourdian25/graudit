@@ -100,7 +100,15 @@ type AuditLog interface {
 	//   - chainID: string — required; from/to are positions within this
 	//     chain only, never across chains
 	//   - from, to: EntryID — inclusive range within chainID; from must be
-	//     >= 1; to == 0 means "through the latest entry" (see above)
+	//     >= 1; to == 0 means "through the latest entry" (see above). A
+	//     range from entry 1 checks the first entry's PrevHash against
+	//     GenesisPrevHash; a range starting later checks it against entry
+	//     from-1's stored Hash (read for that alone: from-1's own Hash is
+	//     not recomputed, being outside the range), so a chain can be
+	//     verified in consecutive windows. A missing from-1 while the range
+	//     holds entries is a break at the range's first entry, Expected
+	//     empty, never an error. (Before v0.7.2 every range starting past
+	//     entry 1 was checked against GenesisPrevHash and read as broken.)
 	//
 	// Returns:
 	//   - ok: bool — true if every entry in range passes both checks
@@ -238,6 +246,27 @@ func (e AuditEvent) Validate() error {
 	return nil
 }
 
+// readFrom is where Verify reads a range starting at from: one entry
+// earlier when from > 1, for rangeAnchor's predecessor.
+func readFrom(from EntryID) EntryID {
+	if from > 1 {
+		return from - 1
+	}
+	return from
+}
+
+// rangeAnchor is the PrevHash a range starting past entry 1 must open
+// with: its predecessor's stored Hash, given as the one element of
+// predecessor, or "" when the predecessor is missing, which no real
+// PrevHash equals, so the range's first entry reads as broken (a deleted
+// entry is tampering, reported, never an error).
+func rangeAnchor(predecessor []string) string {
+	if len(predecessor) == 1 {
+		return predecessor[0]
+	}
+	return ""
+}
+
 // QueryFilter selects entries for Query. Unlike every other field (whose
 // zero value means "don't filter on this"), ChainID is required — Query
 // returns ErrChainIDRequired for an empty ChainID rather than matching
@@ -275,6 +304,8 @@ type VerifyResult struct {
 	// recomputed hash and Actual is the entry's stored Hash; for a
 	// chain-linkage failure, Expected is the previous entry's stored Hash
 	// and Actual is this entry's stored PrevHash. Both empty if Valid.
+	// For a range starting past entry 1 whose predecessor (from-1) is
+	// missing, Expected is empty and Actual is the first entry's PrevHash.
 	Expected string
 	Actual   string
 }
