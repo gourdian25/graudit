@@ -2,7 +2,10 @@
 
 package graudit
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func newMemoryLog() (AuditLog, error) {
 	return NewMemoryAuditLog()
@@ -75,5 +78,33 @@ func TestWithLogger(t *testing.T) {
 	defer a.Close()
 	if concrete := a.(*memoryAuditLog); concrete.logger != rl {
 		t.Fatal("WithLogger did not install the given logger")
+	}
+}
+
+// An entry whose stored fields were edited by moving bytes between two of
+// them (here actor and entity type) must fail Verify: the hash preimage
+// length-prefixes every field (v0.8.0). Before, this edit kept the hash.
+func TestMemoryVerify_DetectsBytesMovedBetweenFields(t *testing.T) {
+	ctx := context.Background()
+	l, err := NewMemoryAuditLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, actor := range []string{"alice", "bob"} {
+		if _, err := l.Record(ctx, AuditEvent{ChainID: "platform", ActorID: actor, EntityType: "user", EntityID: "u1", Action: "user.updated"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := l.(*memoryAuditLog)
+	m.mu.Lock()
+	m.entries[0].ActorID, m.entries[0].EntityType = "aliceu", "ser"
+	m.mu.Unlock()
+
+	ok, res, err := l.Verify(ctx, "platform", 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok || res.BrokenAt != 1 {
+		t.Errorf("Verify after moving bytes from entity type to actor: ok=%v broken at %d; want false at 1", ok, res.BrokenAt)
 	}
 }

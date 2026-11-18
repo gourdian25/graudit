@@ -346,3 +346,41 @@ func TestEncodeCanonical_FalseBoolean(t *testing.T) {
 // re-decoding canonicalJSON's own just-Marshal-ed output can never produce
 // invalid JSON. These are genuinely unreachable defensive branches, not
 // untested gaps.
+
+// Moving bytes across any boundary between two adjacent fields must change
+// the hash. Before v0.8.0 the fields were concatenated bare, and every case
+// below hashed identically to its original, so an edited row passed Verify.
+func TestComputeHash_FieldBoundariesAreUnambiguous(t *testing.T) {
+	at := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	payload := map[string]any{"k": "v"}
+	type entry struct {
+		chain                             string
+		id                                EntryID
+		actor, entityType, entity, action string
+	}
+	hash := func(e entry) string {
+		t.Helper()
+		h, err := ComputeHash(e.chain, e.id, e.actor, e.entityType, e.entity, e.action, payload, at, GenesisPrevHash)
+		if err != nil {
+			t.Fatalf("ComputeHash: %v", err)
+		}
+		return h
+	}
+	original := entry{"tenant-1", 23, "alice", "user", "u1", "user.updated"}
+	for _, tc := range []struct {
+		name    string
+		shifted entry
+	}{
+		{"chain and entry id", entry{"tenant-12", 3, "alice", "user", "u1", "user.updated"}},
+		{"entry id and actor", entry{"tenant-1", 2, "3alice", "user", "u1", "user.updated"}},
+		{"actor and entity type", entry{"tenant-1", 23, "aliceu", "ser", "u1", "user.updated"}},
+		{"entity type and entity id", entry{"tenant-1", 23, "alice", "use", "ru1", "user.updated"}},
+		{"entity id and action", entry{"tenant-1", 23, "alice", "user", "u1user.", "updated"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if hash(tc.shifted) == hash(original) {
+				t.Errorf("%+v hashes like %+v: the boundary between fields is ambiguous", tc.shifted, original)
+			}
+		})
+	}
+}
