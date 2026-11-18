@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-18
+
+### Security
+
+- `ComputeHash` length-prefixes every field of its preimage (an 8-byte big-endian length, then the bytes). Before, the nine fields were concatenated bare, so bytes could move across a boundary between two adjacent fields without changing the preimage: actor `alice` with entity type `user` hashed exactly like actor `aliceu` with entity type `ser`, chain `tenant-1` entry 23 like chain `tenant-12` entry 3, and entity id `u1` with action `user.updated` like `u1user.` with `updated`. An entry edited that way in storage still passed `Verify`, in every backend. It also meant the documented guarantee that an entry can't be spliced into another chain without breaking SHA-256 didn't hold for chain ids that are prefixes of one another. A plain edit of one field was always detected.
+
+### Changed
+
+- **Breaking:** every hash differs from the one v0.7.x computed for the same entry, so a chain written before v0.8.0 fails `Verify` from its first entry under v0.8.0. There is no in-place migration: recreate the chain, or keep verifying it with v0.7.2.
+
+### Added
+
+- `TestComputeHash_FieldBoundariesAreUnambiguous` (every boundary between adjacent fields) and `TestMemoryVerify_DetectsBytesMovedBetweenFields` (the edit above, through `Verify`).
+
 ## [0.7.2] - 2026-11-13
 
 ### Fixed

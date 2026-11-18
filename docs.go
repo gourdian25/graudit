@@ -39,7 +39,9 @@
 //     deployment, plus a separate chain for platform-operator actions
 //   - Hash-chained entries: each entry's Hash covers its own fields
 //     (including ChainID, so an entry can't be spliced from one chain into
-//     another) plus the previous entry's Hash (see ComputeHash)
+//     another), each length-prefixed so no bytes can move between two
+//     fields unnoticed (v0.8.0), plus the previous entry's Hash (see
+//     ComputeHash)
 //   - Verify(chainID, from, to) recomputes one chain across a range and
 //     reports the first broken link, if any, via VerifyResult
 //   - RecordChange diffs a before/after pair and stores the diff as the

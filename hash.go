@@ -5,6 +5,7 @@ package graudit
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,8 +17,20 @@ import (
 // ComputeHash computes the SHA-256 hex-encoded hash for a single chain
 // entry:
 //
-//	SHA256(chainID || entryID || actorID || entityType || entityID ||
-//	       action || canonicalJSON(payload) || timestamp || prevHash)
+//	SHA256(f(chainID) || f(entryID) || f(actorID) || f(entityType) ||
+//	       f(entityID) || f(action) || f(canonicalJSON(payload)) ||
+//	       f(timestamp) || f(prevHash))
+//
+// where f(x) is x's length as an 8-byte big-endian integer followed by x's
+// bytes. The length prefix is load-bearing: before v0.8.0 the fields were
+// concatenated bare, so bytes could move across a boundary without changing
+// the preimage -- actor "alice" with entity type "user" hashed exactly like
+// actor "aliceu" with entity type "ser", and chain "tenant-1" entry 23 like
+// chain "tenant-12" entry 3 -- and an edited row still passed Verify. With
+// every field's length in the preimage, two different field tuples always
+// give two different preimages, so matching a Hash after any edit requires
+// breaking SHA-256. v0.8.0 is a breaking change for that reason: every
+// hash written before it differs from the one this function now computes.
 //
 // Exported so all three backends (memory, postgres, mongo) call the
 // identical function — if a backend computed hashes even slightly
@@ -76,18 +89,32 @@ func ComputeHash(chainID string, entryID EntryID, actorID, entityType, entityID,
 	}
 
 	var buf bytes.Buffer
-	buf.WriteString(chainID)
-	buf.WriteString(strconv.FormatUint(uint64(entryID), 10))
-	buf.WriteString(actorID)
-	buf.WriteString(entityType)
-	buf.WriteString(entityID)
-	buf.WriteString(action)
-	buf.Write(canon)
-	buf.WriteString(timestamp.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano))
-	buf.WriteString(prevHash)
+	for _, field := range [][]byte{
+		[]byte(chainID),
+		[]byte(strconv.FormatUint(uint64(entryID), 10)),
+		[]byte(actorID),
+		[]byte(entityType),
+		[]byte(entityID),
+		[]byte(action),
+		canon,
+		[]byte(timestamp.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano)),
+		[]byte(prevHash),
+	} {
+		writeField(&buf, field)
+	}
 
 	sum := sha256.Sum256(buf.Bytes())
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// writeField appends field to buf as its length (8 bytes, big-endian) and
+// then its bytes, so no two different sequences of fields can produce the
+// same preimage (see ComputeHash).
+func writeField(buf *bytes.Buffer, field []byte) {
+	var n [8]byte
+	binary.BigEndian.PutUint64(n[:], uint64(len(field)))
+	buf.Write(n[:])
+	buf.Write(field)
 }
 
 // DecodeStoredPayload decodes raw (a JSON-encoded Payload as previously

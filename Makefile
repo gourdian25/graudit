@@ -137,7 +137,7 @@ docker-up:
 	else \
 		echo "$(GRSENTRY_COMPOSE) not found; creating$$missing with docker run..."; $(MAKE) --no-print-directory docker-create; \
 	fi
-	@docker inspect gourdian-mongo-standalone >/dev/null 2>&1 || docker run -d --name gourdian-mongo-standalone --restart unless-stopped -p 27019:27017 mongo:8.3 >/dev/null
+	@docker inspect gourdian-mongo-standalone >/dev/null 2>&1 || docker run -d --name gourdian-mongo-standalone --restart unless-stopped -p 27019:27017 mongo:8.3.13 >/dev/null
 	@docker start gourdian-mongo-standalone >/dev/null
 	@echo "Waiting for Postgres..."; $(call wait_for,gourdian-postgres,docker exec gourdian-postgres pg_isready -U postgres_user -d postgres)
 	@docker exec gourdian-postgres psql -U postgres_user -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = 'graudit_test'" | grep -q 1 || \
@@ -159,12 +159,12 @@ docker-create:
 		-e POSTGRES_USER=postgres_user -e POSTGRES_PASSWORD=postgres_password -e POSTGRES_DB=graudit_test \
 		-v gourdian-postgres-data:/var/lib/postgresql postgres:18-alpine
 	@docker inspect gourdian-mongo-auth >/dev/null 2>&1 || { \
-		docker run --rm -v gourdian-mongo-keyfile:/keyfile-dir --entrypoint bash mongo:8.3 -c \
+		docker run --rm -v gourdian-mongo-keyfile:/keyfile-dir --entrypoint bash mongo:8.3.13 -c \
 			'[ -f /keyfile-dir/mongo-keyfile ] || { openssl rand -base64 756 > /keyfile-dir/mongo-keyfile && chmod 400 /keyfile-dir/mongo-keyfile && chown 999:999 /keyfile-dir/mongo-keyfile; }' && \
 		docker run -d --name gourdian-mongo-auth --restart unless-stopped -p 27018:27018 \
 			-e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=mongo_password \
 			-v gourdian-mongo-keyfile:/etc/mongo-keyfile-dir -v gourdian-mongo-data:/data/db \
-			mongo:8.3 --port 27018 --replSet rs0 --keyFile /etc/mongo-keyfile-dir/mongo-keyfile; }
+			mongo:8.3.13 --port 27018 --replSet rs0 --keyFile /etc/mongo-keyfile-dir/mongo-keyfile; }
 
 docker-down:
 	@docker stop $(SHARED_CONTAINERS) gourdian-mongo-standalone 2>/dev/null || true

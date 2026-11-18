@@ -112,6 +112,18 @@ independently (they are separate code paths in every backend): postgres's
 `ListEntriesInRange` and mongo's `Verify`-side `Find` both filter on
 `chain_id`/`chainId`, matching `Query`'s own filtering.
 
+That guarantee also needs every field's boundaries in the preimage, and
+before v0.8.0 they weren't there: the nine fields were concatenated bare.
+Chain `tenant-1` entry 23 then hashed exactly like chain `tenant-12` entry
+3, and the same held at every boundary (actor `alice` with entity type
+`user` like `aliceu` with `ser`), so an entry edited by moving bytes from
+one field to its neighbour kept its `Hash` and passed `Verify`. Since
+v0.8.0 `ComputeHash` writes each field as an 8-byte big-endian length
+followed by its bytes, so two different field tuples never share a
+preimage. The change is breaking: every hash differs from v0.7.x's, and
+there is no migration (the same precedent as below). Recreate a chain
+written before it, or keep verifying it with v0.7.2.
+
 No migration tooling exists for upgrading a pre-multi-chain deployment
 (confirmed no such deployment needed to be preserved when this was added),
 matching this repo's existing precedent of shipping schema-affecting
